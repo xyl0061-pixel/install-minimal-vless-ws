@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Minimal 3x-ui node: panel + single VLESS-WS (security=none) on :443
+# Fixed: valid JSON settings with decryption=none for current xray-core.
 # + firewall + Module01 BBR/FQ/64MB. Designed for fresh Ubuntu/Debian/CentOS-ish VPS.
 #
 # Usage (root):
