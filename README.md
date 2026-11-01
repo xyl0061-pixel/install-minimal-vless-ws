@@ -1,6 +1,6 @@
 # Minimal 3x-ui — VLESS + WebSocket (security=none) one-click
 
-One-shot installer for **xy l Minimal node mode** (same product as `64.81.26.148`):
+One-shot installer for **xy l Minimal node mode** (same product as `203.0.113.10` (example)):
 
 - Latest **MHSanaei 3x-ui** panel (full stack: systemd service, SQLite, xray managed by panel)
 - **Single inbound only**: VLESS + WebSocket, `security=none`, listen **443**, path `/`
@@ -70,9 +70,9 @@ REMARK=zuno2 FORCE=1 bash install-minimal-vless-ws.sh
   Minimal 3x-ui 安装完成 / Install complete
 ════════════════════════════════════════════════════════════
 Panel URL:      http://203.0.113.10:49987/cbad217368f7a5fd/
-Username:       0d797407b5
-Password:       y8FPZDHFMQRlwO
-VLESS link:     vless://d8cd11ee-3f16-44c8-b22d-df29bf6f6f18@203.0.113.10:443?encryption=none&security=none&type=ws&path=%2F#zuno2
+Username:       a1b2c3d4e5
+Password:       ExamplePassw0rd
+VLESS link:     vless://11111111-2222-3333-4444-555555555555@203.0.113.10:443?encryption=none&security=none&type=ws&path=%2F#demo
 ────────────────────────────────────────────────────────────
 Saved (mode 600): /root/minimal-vless-ws-install.txt
 Inbound: VLESS + WS security=none  path=/  port=443
