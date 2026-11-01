@@ -42,6 +42,8 @@ Or pipe from a URL you host:
 curl -fsSL https://YOUR_HOST/install-minimal-vless-ws.sh | bash
 ```
 
+On this workstation the deliverable path is:
+
 `/workspace/tools/install-minimal-vless-ws.sh`
 
 ## Optional environment overrides
@@ -89,6 +91,8 @@ Sysctl:  /etc/sysctl.d/99-vps-opt.conf (BBR if kernel supports; else FQ+64MB onl
 - If x-ui already installed: exits with instructions unless `FORCE=1`
 - Uses official `install.sh` non-interactive env: `XUI_NONINTERACTIVE`, `XUI_USERNAME`, `XUI_PASSWORD`, `XUI_PANEL_PORT`, `XUI_WEB_BASE_PATH`, `XUI_SSL_MODE=none`, `XUI_DB_TYPE=sqlite`
 - Creates inbound properly in panel DB (`inbounds` + `clients` + `client_inbounds` + `client_traffics`), then restarts x-ui and verifies listeners + local panel HTTP
+- Writes valid VLESS settings JSON including required `"decryption":"none"` (current xray-core); repairs DB/config if a half-failed prior run left broken inbound settings
+- No speed-test / 测速 step — install finishes after panel + inbound + listener checks
 
 ## Caveats
 

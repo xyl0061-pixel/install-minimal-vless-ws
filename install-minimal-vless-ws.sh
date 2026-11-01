@@ -276,11 +276,42 @@ handle_existing() {
   fi
   warn "FORCE=1 set: stopping x-ui and preparing reinstall/reconfigure..."
   systemctl stop x-ui 2>/dev/null || true
+  pkill -f '/usr/local/x-ui/bin/xray-linux' 2>/dev/null || true
   # Backup DB if present
   if [[ -f "$XUI_DB" ]]; then
     local bak="${XUI_DB}.bak.$(date +%Y%m%d%H%M%S)"
     cp -a "$XUI_DB" "$bak" 2>/dev/null || true
     warn "Backed up DB to ${bak}"
+  fi
+  # Drop leftover :443 inbound from a half-failed prior run
+  if [[ -f "$XUI_DB" ]] && command -v sqlite3 >/dev/null 2>&1; then
+    local old_ids oid
+    old_ids=$(sqlite3 "$XUI_DB" "SELECT id FROM inbounds WHERE port=${INBOUND_PORT};" 2>/dev/null || true)
+    for oid in $old_ids; do
+      sqlite3 "$XUI_DB" "DELETE FROM client_inbounds WHERE inbound_id=${oid};" 2>/dev/null || true
+      sqlite3 "$XUI_DB" "DELETE FROM client_traffics WHERE inbound_id=${oid};" 2>/dev/null || true
+      sqlite3 "$XUI_DB" "DELETE FROM inbounds WHERE id=${oid};" 2>/dev/null || true
+    done
+    [[ -n "${old_ids:-}" ]] && warn "Removed leftover inbound(s) on :${INBOUND_PORT} (ids: ${old_ids})"
+  fi
+  # Strip broken VLESS from generated config so xray is not crash-looping during reinstall
+  if [[ -f /usr/local/x-ui/bin/config.json ]]; then
+    python3 - <<'PY' 2>/dev/null || true
+import json
+p = "/usr/local/x-ui/bin/config.json"
+try:
+    with open(p, encoding="utf-8") as f:
+        c = json.load(f)
+except Exception:
+    raise SystemExit
+c["inbounds"] = [
+    ib for ib in (c.get("inbounds") or [])
+    if ib.get("protocol") == "tunnel" or ib.get("tag") == "api"
+]
+with open(p, "w", encoding="utf-8") as f:
+    json.dump(c, f, indent=2)
+    f.write("\n")
+PY
   fi
 }
 
@@ -448,6 +479,72 @@ install_3xui() {
   log "3x-ui installed and running"
 }
 
+
+# Guarantee VLESS "decryption":"none" in DB + bin/config.json.
+# Current xray-core hard-requires it; missing field → exit 23 / no :443 bind.
+ensure_vless_decryption() {
+  local cfg="/usr/local/x-ui/bin/config.json"
+  [[ -f "$XUI_DB" ]] || return 0
+
+  python3 - "$XUI_DB" <<'PY' || warn "DB decryption repair skipped (python failed)"
+import json, sqlite3, sys
+db = sys.argv[1]
+con = sqlite3.connect(db)
+cur = con.cursor()
+fixed = 0
+for iid, settings in cur.execute("SELECT id, settings FROM inbounds WHERE protocol='vless'"):
+    obj = None
+    raw_ok = False
+    if settings:
+        try:
+            obj = json.loads(settings)
+            raw_ok = True
+        except Exception:
+            obj = None
+    if not isinstance(obj, dict):
+        obj = {"clients": [], "decryption": "none", "fallbacks": []}
+        raw_ok = False
+    if obj.get("decryption") != "none":
+        obj["decryption"] = "none"
+        raw_ok = False
+    if not raw_ok or obj.get("decryption") != "none":
+        cur.execute(
+            "UPDATE inbounds SET settings=? WHERE id=?",
+            (json.dumps(obj, separators=(",", ":")), iid),
+        )
+        fixed += 1
+if fixed:
+    con.commit()
+    print(f"repaired {fixed} vless inbound settings row(s)")
+else:
+    print("vless inbound settings OK")
+con.close()
+PY
+
+  if [[ -f "$cfg" ]]; then
+    python3 - "$cfg" <<'PY' || warn "config.json decryption patch skipped"
+import json, sys
+p = sys.argv[1]
+with open(p, encoding="utf-8") as f:
+    c = json.load(f)
+n = 0
+for ib in c.get("inbounds") or []:
+    if ib.get("protocol") == "vless":
+        st = ib.setdefault("settings", {})
+        if st.get("decryption") != "none":
+            st["decryption"] = "none"
+            n += 1
+if n:
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(c, f, indent=2)
+        f.write("\n")
+    print(f"patched decryption on {n} config inbound(s)")
+else:
+    print("config.json vless decryption OK")
+PY
+  fi
+}
+
 # ---------- inbound via SQLite ----------
 sql_exec() {
   if command -v sqlite3 >/dev/null 2>&1; then
@@ -483,11 +580,31 @@ create_vless_inbound() {
   ts=$(now_ms)
   sub_id=$(gen_hex 16)
 
-  # Escape for JSON strings
+  # Build VLESS settings JSON safely.
+  # BUGFIX: previous `printf '%s' "{"clients":...}"` let bash eat every double-quote,
+  # storing invalid JSON in SQLite. 3x-ui then regenerated config.json WITHOUT
+  # "decryption":"none", and current xray-core aborted with exit status 23.
   local settings stream sniffing
-  settings=$(printf '%s' "{"clients":[{"id":"${uuid}","security":"","email":"${email_tag}","limitIp":0,"totalGB":0,"expiryTime":0,"enable":true,"tgId":0,"subId":"${sub_id}","comment":"","reset":0,"resetDay":0,"resetWeekday":0,"resetMax":0,"created_at":${ts},"updated_at":${ts}}],"decryption":"none","fallbacks":[]}")
-  stream='{"network": "ws", "security": "none", "externalProxy": [], "wsSettings": {"acceptProxyProtocol": false, "path": "/", "host": "", "headers": {}}}'
-  sniffing='{"enabled": true, "destOverride": ["http", "tls", "quic", "fakedns"], "metadataOnly": false, "routeOnly": false}'
+  if command -v jq >/dev/null 2>&1; then
+    settings=$(jq -nc \
+      --arg id "$uuid" \
+      --arg email "$email_tag" \
+      --arg sub "$sub_id" \
+      --argjson ts "$ts" \
+      '{clients:[{id:$id,security:"",email:$email,limitIp:0,totalGB:0,expiryTime:0,enable:true,tgId:0,subId:$sub,comment:"",reset:0,resetDay:0,resetWeekday:0,resetMax:0,created_at:$ts,updated_at:$ts}],decryption:"none",fallbacks:[]}')
+  else
+    settings=$(python3 -c 'import json,sys; u,e,s,t=sys.argv[1:5]; print(json.dumps({"clients":[{"id":u,"security":"","email":e,"limitIp":0,"totalGB":0,"expiryTime":0,"enable":True,"tgId":0,"subId":s,"comment":"","reset":0,"resetDay":0,"resetWeekday":0,"resetMax":0,"created_at":int(t),"updated_at":int(t)}],"decryption":"none","fallbacks":[]},separators=(",",":")))' \
+      "$uuid" "$email_tag" "$sub_id" "$ts")
+  fi
+  if command -v jq >/dev/null 2>&1; then
+    echo "$settings" | jq -e '.decryption=="none" and (.clients|type=="array")' >/dev/null \
+      || die "Internal error: VLESS settings JSON invalid or missing decryption=none"
+  else
+    python3 -c 'import json,sys; j=json.loads(sys.argv[1]); assert j.get("decryption")=="none" and isinstance(j.get("clients"),list)' "$settings" \
+      || die "Internal error: VLESS settings JSON invalid or missing decryption=none"
+  fi
+  stream='{"network":"ws","security":"none","externalProxy":[],"wsSettings":{"acceptProxyProtocol":false,"path":"/","host":"","headers":{}}}'
+  sniffing='{"enabled":true,"destOverride":["http","tls","quic","fakedns"],"metadataOnly":false,"routeOnly":false}'
 
   # Remove any existing :443 vless inbound (FORCE / re-run)
   if command -v sqlite3 >/dev/null 2>&1; then
@@ -617,15 +734,32 @@ print(f"client_id={client_id} inbound_id={inbound_id}")
 PY
   fi
 
+  # Ensure DB JSON is valid with decryption before panel rebuilds xray config
+  ensure_vless_decryption
+
   systemctl start x-ui
   sleep 2
   systemctl is-active --quiet x-ui || die "x-ui failed to start after inbound insert"
   # Trigger migrate / reload if available
   "$XUI_BIN" migrate >/dev/null 2>&1 || true
+  # migrate/restart may rewrite config.json from DB — reinforce decryption
+  ensure_vless_decryption
   systemctl restart x-ui
   sleep 3
+  # Final pass in case restart rewrote config again without the field
+  ensure_vless_decryption
+  if systemctl is-active --quiet x-ui; then
+    :
+  else
+    systemctl restart x-ui
+    sleep 2
+  fi
+  # Only restart again if we actually patched config after last start
+  systemctl restart x-ui
+  sleep 2
   log "Inbound created (remark=${remark}, uuid=${uuid})"
 }
+
 
 # ---------- verify ----------
 verify_listen() {
