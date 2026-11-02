@@ -39,18 +39,30 @@ ssh -p <ssh_port> root@SERVER 'bash /root/install-minimal-vless-ws.sh'
 Or pipe from a URL you host:
 
 ```bash
-curl -fsSL https://YOUR_HOST/install-minimal-vless-ws.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh | bash
 ```
 
 On this workstation the deliverable path is:
 
 `/workspace/tools/install-minimal-vless-ws.sh`
 
+## Node alias (REMARK)
+
+When the installer reaches **creating the VLESS inbound** (after the panel is up):
+
+| Situation | Behavior |
+|-----------|----------|
+| `REMARK` env already set | Use it (no prompt). Good for automation / `REMARK=foo curl\|bash`. |
+| Interactive TTY, `REMARK` unset | Prompt in Chinese: 请输入节点别名…; empty input → hostname default (and say so). |
+| Non-TTY / pipe (`curl\|bash`), `REMARK` unset | Hostname default — **does not hang** waiting for input. Prints a one-line hint to set `REMARK=别名`. |
+
+The chosen value is used for the 3x-ui inbound remark, the `vless://…#REMARK` fragment (URL-encoded), and `/root/minimal-vless-ws-install.txt`. Input is sanitized (spaces/newlines stripped; keep alnum / `_-.` / Chinese).
+
 ## Optional environment overrides
 
 | Env | Meaning |
 |-----|---------|
-| `REMARK` | Inbound remark / `#fragment` in vless link (default: short hostname or IP tag) |
+| `REMARK` | Inbound remark / `#fragment` in vless link. If unset: interactive prompt on TTY, else hostname. |
 | `PANEL_PORT` | Fixed panel port (default: random 20000–62000) |
 | `PANEL_USER` / `PANEL_PASS` | Fixed panel credentials (default: random) |
 | `WEB_BASE_PATH` | Panel path without required slashes (default: random 16 hex) |
@@ -59,10 +71,15 @@ On this workstation the deliverable path is:
 | `FORCE=1` | Reinstall / reconfigure over an existing x-ui install |
 | `XUI_ENABLE_FAIL2BAN=false` | Default in script; set `true` to let official installer set up fail2ban |
 
-Example:
+Examples:
 
 ```bash
+# Interactive: prompt for alias when creating the VLESS inbound
+bash install-minimal-vless-ws.sh
+
+# Non-interactive override (also works with curl|bash)
 REMARK=zuno2 FORCE=1 bash install-minimal-vless-ws.sh
+REMARK=zuno2 curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh | bash
 ```
 
 ## What the final banner looks like

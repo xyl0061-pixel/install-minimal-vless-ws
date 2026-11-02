@@ -10,6 +10,8 @@
 #
 # Optional env: REMARK PANEL_PORT PANEL_USER PANEL_PASS WEB_BASE_PATH UUID
 #               SKIP_SYSCTL=1 FORCE=1 XUI_ENABLE_FAIL2BAN=false
+# REMARK: if unset and stdin is a TTY, prompt when creating the VLESS inbound;
+#         if unset and non-TTY (e.g. curl|bash), default to hostname (no hang).
 set -euo pipefail
 
 readonly SCRIPT_NAME="install-minimal-vless-ws"
@@ -546,6 +548,104 @@ PY
   fi
 }
 
+# ---------- REMARK (node alias) ----------
+default_remark_from_host() {
+  local server_ip="$1" remark
+  remark=$(hostname -s 2>/dev/null || true)
+  [[ -n "$remark" && "$remark" != "localhost" ]] || remark="node-$(echo "$server_ip" | tr '.' '-')"
+  remark=$(printf '%s' "$remark" | tr -cd 'A-Za-z0-9._-' | head -c 32)
+  [[ -n "$remark" ]] || remark="vless-ws"
+  printf '%s' "$remark"
+}
+
+# Strip whitespace/newlines; keep alnum, _-., and CJK; drop URI breakers.
+sanitize_remark() {
+  local raw="$1" out=""
+  if command -v python3 >/dev/null 2>&1; then
+    out=$(REMARK_RAW="$raw" python3 - <<'PY'
+import os, re
+s = os.environ.get("REMARK_RAW", "")
+s = re.sub(r"\s+", "", s)
+keep = []
+for ch in s:
+    o = ord(ch)
+    if ch.isalnum() or ch in "._-":
+        keep.append(ch)
+    elif 0x4E00 <= o <= 0x9FFF or 0x3400 <= o <= 0x4DBF:  # CJK
+        keep.append(ch)
+    # else drop (# ? & % / \\ = + quotes, control, etc.)
+print("".join(keep)[:64])
+PY
+) || out=""
+  else
+    out=$(printf '%s' "$raw" | tr -d '\r\n\t ' | tr -cd 'A-Za-z0-9._-' | head -c 64)
+  fi
+  printf '%s' "$out"
+}
+
+# Percent-encode fragment for vless://...#remark (safe for Chinese / odd chars).
+urlencode_fragment() {
+  local s="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    FRAG_RAW="$s" python3 - <<'PY'
+import os, urllib.parse
+print(urllib.parse.quote(os.environ.get("FRAG_RAW", ""), safe="-_.~"))
+PY
+    return
+  fi
+  printf '%s' "$s"
+}
+
+# Resolve REMARK just before creating the VLESS inbound.
+# Sets caller's variable via printf -v (arg2, default: remark) so log lines stay on stdout.
+# - REMARK env set  -> use it (automation / curl|bash with env)
+# - TTY + unset     -> interactive Chinese prompt
+# - non-TTY + unset -> hostname default (never hang on pipe)
+resolve_remark() {
+  local server_ip="$1"
+  local __var="${2:-remark}"
+  # Use __r (not remark) so printf -v can set caller's local remark via dynamic scope
+  local __r="" def
+  def=$(default_remark_from_host "$server_ip")
+
+  if [[ -n "${REMARK:-}" ]]; then
+    __r=$(sanitize_remark "$REMARK")
+    if [[ -z "$__r" ]]; then
+      __r="$def"
+      warn "REMARK env sanitized to empty; falling back to hostname: ${__r}"
+    else
+      log "Using REMARK from environment: ${__r}"
+    fi
+    printf -v "$__var" '%s' "$__r"
+    return
+  fi
+
+  if [[ -t 0 ]]; then
+    echo
+    echo -e "${blue}请输入节点别名（remark，将出现在 vless 链接 # 后面）${plain}"
+    echo -e "${yellow}直接回车则使用主机名默认: ${def}${plain}"
+    printf '%s' "别名: "
+    # Prefer /dev/tty so prompt still works if stdin was redirected oddly
+    if [[ -r /dev/tty ]]; then
+      read -r __r </dev/tty || __r=""
+    else
+      read -r __r || __r=""
+    fi
+    __r=$(sanitize_remark "${__r:-}")
+    if [[ -z "$__r" ]]; then
+      __r="$def"
+      log "未输入别名，使用主机名默认: ${__r}"
+    else
+      log "节点别名 REMARK=${__r}"
+    fi
+  else
+    __r="$def"
+    log "非交互安装（stdin 非 TTY），使用主机名作为 REMARK=${__r}"
+    log "提示: 可设置 REMARK=别名 覆盖，例如: REMARK=myserver bash install-minimal-vless-ws.sh"
+  fi
+  printf -v "$__var" '%s' "$__r"
+}
+
 # ---------- inbound via SQLite ----------
 sql_exec() {
   if command -v sqlite3 >/dev/null 2>&1; then
@@ -850,15 +950,8 @@ main() {
   [[ -n "$server_ip" ]] || server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
   [[ -n "$server_ip" ]] || server_ip="YOUR_SERVER_IP"
 
-  if [[ -n "${REMARK:-}" ]]; then
-    remark="$REMARK"
-  else
-    remark=$(hostname -s 2>/dev/null || true)
-    [[ -n "$remark" && "$remark" != "localhost" ]] || remark="node-$(echo "$server_ip" | tr '.' '-')"
-    # short safe tag
-    remark=$(printf '%s' "$remark" | tr -cd 'A-Za-z0-9._-' | head -c 32)
-    [[ -n "$remark" ]] || remark="vless-ws"
-  fi
+  # REMARK is resolved interactively later, right before creating the VLESS inbound
+  remark=""
 
   panel_port="${PANEL_PORT:-}"
   if [[ -z "$panel_port" ]]; then
@@ -882,13 +975,6 @@ main() {
   # normalize
   web_base="${web_base#/}"; web_base="${web_base%/}"
 
-  uuid=$(gen_uuid | tr -d '[:space:]')
-  [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Invalid UUID generated/provided: ${uuid}"
-
-  email_tag="${remark}-ws"
-  email_tag=$(printf '%s' "$email_tag" | tr -cd 'A-Za-z0-9._@-' | head -c 64)
-  [[ -n "$email_tag" ]] || email_tag="node-ws"
-
   apply_sysctl
   install_3xui "$panel_user" "$panel_pass" "$panel_port" "$web_base" "$server_ip"
 
@@ -906,11 +992,29 @@ main() {
   systemctl restart x-ui
   sleep 2
 
+  # --- VLESS inbound step: resolve REMARK (interactive if TTY), then UUID ---
+  resolve_remark "$server_ip" remark
+  [[ -n "$remark" ]] || die "REMARK resolved empty"
+
+  uuid=$(gen_uuid | tr -d '[:space:]')
+  [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Invalid UUID generated/provided: ${uuid}"
+
+  email_tag="${remark}-ws"
+  # email stays ASCII-safe for DB; strip non-ASCII from tag
+  if command -v python3 >/dev/null 2>&1; then
+    email_tag=$(EMAIL_RAW="$email_tag" python3 -c 'import os,re; s=os.environ["EMAIL_RAW"]; print(re.sub(r"[^A-Za-z0-9._@-]","",s)[:64] or "node-ws")')
+  else
+    email_tag=$(printf '%s' "$email_tag" | tr -cd 'A-Za-z0-9._@-' | head -c 64)
+  fi
+  [[ -n "$email_tag" ]] || email_tag="node-ws"
+
   create_vless_inbound "$uuid" "$remark" "$email_tag"
 
   wbp_url="/${web_base}/"
   panel_url="http://${server_ip}:${panel_port}${wbp_url}"
-  vless="vless://${uuid}@${server_ip}:${INBOUND_PORT}?encryption=none&security=none&type=ws&path=%2F#${remark}"
+  local remark_frag
+  remark_frag=$(urlencode_fragment "$remark")
+  vless="vless://${uuid}@${server_ip}:${INBOUND_PORT}?encryption=none&security=none&type=ws&path=%2F#${remark_frag}"
 
   open_firewall "$panel_port"
   verify_listen "$panel_port" "$wbp_url"
