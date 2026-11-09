@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Minimal 3x-ui node: panel + single VLESS-WS (security=none) on :443
 # Fixed: valid JSON settings with decryption=none for current xray-core.
-# + firewall + Module01 BBR/FQ/64MB. Designed for fresh Ubuntu/Debian/CentOS-ish VPS.
+# + firewall + Module01 BBR/FQ/64MB. Auto-detects Ubuntu/Debian and CentOS/RHEL
+#   (including CentOS 7): same curl|bash entry, no distro flag.
 #
 # Usage (root):
 #   curl -fsSL <url> | bash
@@ -12,6 +13,8 @@
 #               SKIP_SYSCTL=1 FORCE=1 XUI_ENABLE_FAIL2BAN=false
 # REMARK: if unset and stdin is a TTY, prompt when creating the VLESS inbound;
 #         if unset and non-TTY (e.g. curl|bash), default to hostname (no hang).
+#
+# Tests may source this file with INSTALL_MINIMAL_VLESS_WS_LIB=1 to skip main.
 set -euo pipefail
 
 readonly SCRIPT_NAME="install-minimal-vless-ws"
@@ -22,6 +25,9 @@ readonly XUI_BIN="/usr/local/x-ui/x-ui"
 readonly INBOUND_PORT=443
 readonly WS_PATH="/"
 readonly INSTALL_SH_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh"
+readonly XUI_RELEASE_REPO="MHSanaei/3x-ui"
+readonly XUI_RELEASE_BASE="https://github.com/MHSanaei/3x-ui/releases"
+
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
 
@@ -148,45 +154,227 @@ require_root() {
 }
 
 detect_os() {
+  OS_ID=""
+  OS_VER=""
+  OS_LIKE=""
+  OS_MAJOR=""
+  OS_PRETTY=""
+
   if [[ -f /etc/os-release ]]; then
     # shellcheck disable=SC1091
     source /etc/os-release
     OS_ID="${ID:-}"
     OS_VER="${VERSION_ID:-}"
     OS_LIKE="${ID_LIKE:-}"
+    OS_PRETTY="${PRETTY_NAME:-}"
   elif [[ -f /usr/lib/os-release ]]; then
     # shellcheck disable=SC1091
     source /usr/lib/os-release
     OS_ID="${ID:-}"
     OS_VER="${VERSION_ID:-}"
     OS_LIKE="${ID_LIKE:-}"
+    OS_PRETTY="${PRETTY_NAME:-}"
+  elif [[ -f /etc/centos-release ]]; then
+    # Legacy CentOS without os-release
+    OS_ID="centos"
+    OS_VER="$(tr -dc '0-9.' </etc/centos-release | head -c 8)"
+    OS_LIKE="rhel fedora"
+    OS_PRETTY="$(tr -d '\n' </etc/centos-release)"
+  elif [[ -f /etc/redhat-release ]]; then
+    OS_PRETTY="$(tr -d '\n' </etc/redhat-release)"
+    if grep -qi centos /etc/redhat-release; then
+      OS_ID="centos"
+    else
+      OS_ID="rhel"
+    fi
+    OS_VER="$(tr -dc '0-9.' </etc/redhat-release | head -c 8)"
+    OS_LIKE="rhel fedora"
   else
-    die "Unsupported OS: cannot read /etc/os-release. Need Ubuntu/Debian/CentOS/Alma/Rocky/RHEL."
+    die "Unsupported OS: cannot read /etc/os-release (or centos/redhat-release). Need Ubuntu/Debian/CentOS/Alma/Rocky/RHEL."
   fi
+
+  OS_ID="$(printf '%s' "$OS_ID" | tr '[:upper:]' '[:lower:]')"
+  OS_MAJOR="${OS_VER%%.*}"
 
   case "${OS_ID}" in
     ubuntu|debian|armbian)
       PKG_FAM="apt"
       ;;
     centos|rhel|almalinux|rocky|ol|fedora|amzn|virtuozzo)
-      if command -v dnf >/dev/null 2>&1; then
+      # CentOS/RHEL 7: prefer yum even if a stray dnf exists
+      if [[ "$OS_ID" == "centos" || "$OS_ID" == "rhel" ]] && [[ "${OS_MAJOR}" == "7" ]]; then
+        PKG_FAM="yum"
+      elif command -v dnf >/dev/null 2>&1; then
         PKG_FAM="dnf"
       else
         PKG_FAM="yum"
       fi
       ;;
     *)
-      # Tolerate ID_LIKE
       if [[ "${OS_LIKE}" == *debian* || "${OS_LIKE}" == *ubuntu* ]]; then
         PKG_FAM="apt"
       elif [[ "${OS_LIKE}" == *rhel* || "${OS_LIKE}" == *centos* || "${OS_LIKE}" == *fedora* ]]; then
-        if command -v dnf >/dev/null 2>&1; then PKG_FAM="dnf"; else PKG_FAM="yum"; fi
+        if [[ "${OS_MAJOR}" == "7" ]]; then
+          PKG_FAM="yum"
+        elif command -v dnf >/dev/null 2>&1; then PKG_FAM="dnf"; else PKG_FAM="yum"; fi
       else
         die "Unsupported OS '${OS_ID}'. Supported: Ubuntu/Debian/CentOS/Alma/Rocky/RHEL/Fedora/Amazon Linux."
       fi
       ;;
   esac
-  log "OS detected: ${OS_ID} ${OS_VER} (pkg=${PKG_FAM})"
+
+  log "OS detected: ${OS_ID} ${OS_VER} (major=${OS_MAJOR:-?} pkg=${PKG_FAM}${OS_PRETTY:+; ${OS_PRETTY}})"
+}
+
+# Official CentOS 7 vault only (EOL mirrorlist is often dead). Scoped, reversible backup.
+maybe_fix_centos7_yum_repos() {
+  [[ "${OS_ID}" == "centos" ]] || return 0
+  [[ "${OS_MAJOR}" == "7" ]] || return 0
+  shopt -s nullglob
+  local repos=(/etc/yum.repos.d/CentOS-*.repo)
+  shopt -u nullglob
+  [[ ${#repos[@]} -gt 0 ]] || return 0
+
+  local needs=0 r
+  for r in "${repos[@]}"; do
+    if grep -Eq 'mirrorlist\.centos\.org|mirror\.centos\.org' "$r" 2>/dev/null; then
+      needs=1
+      break
+    fi
+  done
+  [[ $needs -eq 1 ]] || return 0
+
+  warn "CentOS 7 is EOL; mirrorlist.centos.org is often dead. Switching base repos to official vault.centos.org (backup under /etc/yum.repos.d/bak-minimal-vless-ws)."
+  mkdir -p /etc/yum.repos.d/bak-minimal-vless-ws
+  for r in "${repos[@]}"; do
+    cp -a "$r" "/etc/yum.repos.d/bak-minimal-vless-ws/$(basename "$r").bak" 2>/dev/null || true
+    # Comment mirrorlist; enable vault baseurl (keep http/https as published by CentOS vault docs)
+    sed -i \
+      -e 's/^mirrorlist=/#mirrorlist=/g' \
+      -e 's/^#[[:space:]]*baseurl=http:\/\/mirror\.centos\.org/baseurl=http:\/\/vault.centos.org/g' \
+      -e 's/^baseurl=http:\/\/mirror\.centos\.org/baseurl=http:\/\/vault.centos.org/g' \
+      -e 's/^#[[:space:]]*baseurl=https:\/\/mirror\.centos\.org/baseurl=https:\/\/vault.centos.org/g' \
+      -e 's/^baseurl=https:\/\/mirror\.centos\.org/baseurl=https:\/\/vault.centos.org/g' \
+      "$r"
+  done
+}
+
+# Kernel capability probes (independent of distro ID). Never auto-upgrade kernel / reboot.
+kernel_has_bbr() {
+  if [[ -d /sys/module/tcp_bbr ]]; then
+    return 0
+  fi
+  if modprobe tcp_bbr >/dev/null 2>&1 && [[ -d /sys/module/tcp_bbr ]]; then
+    return 0
+  fi
+  if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+    return 0
+  fi
+  if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    return 0
+  fi
+  return 1
+}
+
+kernel_has_fq() {
+  if [[ -d /sys/module/sch_fq ]]; then
+    return 0
+  fi
+  if modprobe sch_fq >/dev/null 2>&1 && [[ -d /sys/module/sch_fq ]]; then
+    return 0
+  fi
+  # Some kernels expose fq without a separate module dir
+  if [[ -e /proc/sys/net/core/default_qdisc ]]; then
+    return 0
+  fi
+  return 1
+}
+
+# Apply one sysctl key; skip unsupported keys without aborting the installer.
+sysctl_set_safe() {
+  local key="$1" val="$2"
+  if ! sysctl -w "${key}=${val}" >/dev/null 2>&1; then
+    warn "sysctl unsupported or refused on this kernel: ${key}=${val} (skipped)"
+    return 1
+  fi
+  return 0
+}
+
+# Resilient HTTPS download (GitHub release CDN often returns transient 504).
+# No third-party mirrors; no insecure TLS. Uses curl then wget, exponential backoff.
+download_with_retry() {
+  local url="$1" dest="$2"
+  local max_attempts="${3:-8}"
+  local attempt=1 delay=3
+  local tmp partial code
+  partial="${dest}.partial.$$"
+  tmp="$(dirname "$dest")"
+  mkdir -p "$tmp" 2>/dev/null || true
+
+  while (( attempt <= max_attempts )); do
+    rm -f "$partial"
+    code="000"
+    if command -v curl >/dev/null 2>&1; then
+      # Do not append a fallback via || echo — that concatenates onto %{http_code}.
+      code=$(curl -sS -L --connect-timeout 20 --max-time 600 \
+        -o "$partial" -w '%{http_code}' "$url" 2>/dev/null) || true
+      [[ -n "$code" ]] || code="000"
+      if [[ "$code" == "200" && -s "$partial" ]]; then
+        mv -f "$partial" "$dest"
+        return 0
+      fi
+    fi
+    if [[ ! -s "$dest" ]] && command -v wget >/dev/null 2>&1; then
+      rm -f "$partial"
+      if wget -O "$partial" --timeout=600 --tries=1 "$url" >/dev/null 2>&1 && [[ -s "$partial" ]]; then
+        mv -f "$partial" "$dest"
+        return 0
+      fi
+    fi
+    warn "Download failed (attempt ${attempt}/${max_attempts}, http=${code}): ${url}"
+    rm -f "$partial"
+    if (( attempt >= max_attempts )); then
+      break
+    fi
+    sleep "$delay"
+    delay=$(( delay * 2 ))
+    (( delay > 30 )) && delay=30
+    attempt=$((attempt + 1))
+  done
+  rm -f "$partial"
+  return 1
+}
+
+detect_xui_arch() {
+  case "$(uname -m)" in
+    x86_64|x64|amd64) echo 'amd64' ;;
+    i*86|x86) echo '386' ;;
+    armv8*|armv8|arm64|aarch64) echo 'arm64' ;;
+    armv7*|armv7|arm) echo 'armv7' ;;
+    armv6*|armv6) echo 'armv6' ;;
+    armv5*|armv5) echo 'armv5' ;;
+    s390x) echo 's390x' ;;
+    *) echo '' ;;
+  esac
+}
+
+resolve_3xui_latest_tag() {
+  local url tag json
+  url=$(curl -sSLI -o /dev/null -w '%{url_effective}' --connect-timeout 15 --max-time 60 \
+    "${XUI_RELEASE_BASE}/latest" 2>/dev/null || true)
+  tag="${url##*/tag/}"
+  if [[ -n "$tag" && "$tag" != "$url" && "$tag" != "latest" ]]; then
+    printf '%s' "$tag"
+    return 0
+  fi
+  json=$(curl -fsSL --connect-timeout 15 --max-time 60 \
+    "https://api.github.com/repos/${XUI_RELEASE_REPO}/releases/latest" 2>/dev/null || true)
+  tag=$(printf '%s' "$json" | grep -oE '"tag_name":[[:space:]]*"[^"]+"' | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+  if [[ -n "$tag" ]]; then
+    printf '%s' "$tag"
+    return 0
+  fi
+  return 1
 }
 
 check_internet() {
@@ -229,13 +417,21 @@ install_deps() {
       dnf install -y -q sqlite >/dev/null 2>&1 || dnf install -y -q sqlite3 >/dev/null 2>&1 || true
       ;;
     yum)
-      pkg_retry "yum makecache" yum makecache -y
+      maybe_fix_centos7_yum_repos
+      if ! yum makecache -y; then
+        warn "yum makecache failed; attempting CentOS 7 vault.centos.org repo fix and retry"
+        maybe_fix_centos7_yum_repos
+        pkg_retry "yum makecache" yum makecache -y
+      fi
       pkg_retry "yum install" yum install -y \
         curl wget tar unzip socat openssl ca-certificates \
         cronie tzdata iproute
+      # CentOS 7: jq often needs epel; keep optional
       yum install -y jq >/dev/null 2>&1 || true
       yum install -y sqlite >/dev/null 2>&1 || yum install -y sqlite3 >/dev/null 2>&1 || true
       yum install -y util-linux >/dev/null 2>&1 || true
+      # Refresh CA bundle when possible (EOL hosts may have stale roots)
+      yum update -y ca-certificates >/dev/null 2>&1 || true
       ;;
   esac
 
@@ -319,30 +515,45 @@ PY
 }
 
 # ---------- sysctl Module01 ----------
+# Distro detection (OS_ID) is separate from kernel capability (BBR/FQ).
+# Stock CentOS 7 / 3.10 usually has no tcp_bbr; some hosts ship a newer kernel.
+# Never claim BBR enabled unless live sysctl verifies it; never reboot/upgrade kernel.
 apply_sysctl() {
   if [[ "${SKIP_SYSCTL:-0}" == "1" ]]; then
     warn "SKIP_SYSCTL=1 — skipping BBR/FQ/buffer tuning"
     return 0
   fi
-  log "Applying Module01-style sysctl (FQ + 64MB buffers; BBR if available)..."
+  log "Applying Module01-style sysctl (FQ + 64MB buffers; BBR only if kernel supports)..."
 
-  local have_bbr=0
-  if [[ -d /sys/module/tcp_bbr ]] || modprobe tcp_bbr 2>/dev/null; then
-    have_bbr=1
-  elif grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-    have_bbr=1
-  elif sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
-    have_bbr=1
+  local want_bbr=0 want_fq=0
+  local bbr_live=0 fq_live=0
+  local kver
+  kver="$(uname -r 2>/dev/null || echo unknown)"
+
+  if kernel_has_bbr; then
+    want_bbr=1
+  else
+    warn "Kernel ${kver}: tcp_bbr not available (common on CentOS 7 / 3.10). BBR will be skipped; installer continues."
+  fi
+  if kernel_has_fq; then
+    want_fq=1
+  else
+    warn "Kernel ${kver}: sch_fq / default_qdisc not usable. FQ will be skipped; buffer tuning still attempted."
   fi
 
   {
     echo "# Module 01: 64MB stack + BBR + FQ (written by ${SCRIPT_NAME})"
     echo "# Generated: $(date -Iseconds 2>/dev/null || date)"
-    echo "net.core.default_qdisc = fq"
-    if [[ $have_bbr -eq 1 ]]; then
+    echo "# Host kernel: ${kver}  OS: ${OS_ID:-?} ${OS_VER:-?}"
+    if [[ $want_fq -eq 1 ]]; then
+      echo "net.core.default_qdisc = fq"
+    else
+      echo "# net.core.default_qdisc = fq  # skipped: fq not available"
+    fi
+    if [[ $want_bbr -eq 1 ]]; then
       echo "net.ipv4.tcp_congestion_control = bbr"
     else
-      echo "# net.ipv4.tcp_congestion_control = bbr  # skipped: tcp_bbr not available (old kernel?)"
+      echo "# net.ipv4.tcp_congestion_control = bbr  # skipped: tcp_bbr not available"
     fi
     echo
     echo "net.core.rmem_max = 67108864"
@@ -364,16 +575,59 @@ apply_sysctl() {
     echo "net.ipv4.tcp_fin_timeout = 15"
   } > "$SYSCTL_FILE"
 
-  if [[ $have_bbr -eq 0 ]]; then
-    warn "Kernel has no tcp_bbr (common on CentOS 7 / 3.10). FQ + 64MB buffers still applied; BBR skipped (not aborting)."
-  else
-    log "BBR module available — enabled"
+  # Apply key-by-key so one unsupported knob (e.g. tcp_notsent_lowat on 3.10) cannot abort install.
+  # Snapshot lines first — never sed the file we are reading.
+  local key val applied=0 skipped=0
+  local -a sysctl_lines=()
+  local line
+  mapfile -t sysctl_lines < "$SYSCTL_FILE" || true
+  : > "$SYSCTL_FILE"
+  for line in "${sysctl_lines[@]}"; do
+    if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "${line//[[:space:]]/}" ]]; then
+      printf '%s\n' "$line" >> "$SYSCTL_FILE"
+      continue
+    fi
+    key="${line%%=*}"
+    key="${key%"${key##*[![:space:]]}"}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    val="${line#*=}"
+    val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%"${val##*[![:space:]]}"}"
+    if [[ -z "$key" ]]; then
+      printf '%s\n' "$line" >> "$SYSCTL_FILE"
+      continue
+    fi
+    if sysctl_set_safe "$key" "$val"; then
+      applied=$((applied + 1))
+      printf '%s = %s\n' "$key" "$val" >> "$SYSCTL_FILE"
+    else
+      skipped=$((skipped + 1))
+      printf '# %s = %s  # skipped: unsupported on this kernel\n' "$key" "$val" >> "$SYSCTL_FILE"
+    fi
+  done
+
+  # Live verification — only report enabled after reading current kernel values
+  if [[ $want_bbr -eq 1 ]]; then
+    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" == "bbr" ]]; then
+      bbr_live=1
+      log "BBR enabled (live: net.ipv4.tcp_congestion_control=bbr)"
+    else
+      warn "BBR was requested but live congestion control is '$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)' — not claiming enabled."
+    fi
+  fi
+  if [[ $want_fq -eq 1 ]]; then
+    if [[ "$(sysctl -n net.core.default_qdisc 2>/dev/null || true)" == "fq" ]]; then
+      fq_live=1
+      log "FQ qdisc enabled (live: net.core.default_qdisc=fq)"
+    else
+      warn "FQ was requested but live default_qdisc is '$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)'."
+    fi
   fi
 
-  sysctl --system >/dev/null 2>&1 || sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || warn "sysctl apply returned non-zero; values written to ${SYSCTL_FILE}"
+  log "Sysctl apply summary: applied=${applied} skipped=${skipped} bbr_live=${bbr_live} fq_live=${fq_live} file=${SYSCTL_FILE}"
 
-  # Best-effort set fq on default route iface
-  if command -v tc >/dev/null 2>&1; then
+  # Best-effort set fq on default route iface (non-fatal)
+  if [[ $fq_live -eq 1 ]] && command -v tc >/dev/null 2>&1; then
     local iface
     iface=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
     if [[ -n "${iface:-}" ]]; then
@@ -432,16 +686,111 @@ open_firewall() {
 }
 
 # ---------- install 3x-ui ----------
+# Official install.sh curls the GitHub release tarball; that CDN often returns
+# transient HTTP 504. We pre-download with download_with_retry (no third-party
+# mirrors, no insecure TLS) and patch the temp install.sh to reuse the archive.
 install_3xui() {
   local panel_user="$1" panel_pass="$2" panel_port="$3" web_base="$4" server_ip="$5"
 
   log "Installing latest MHSanaei 3x-ui (non-interactive)..."
-  local tmp
+  local tmp arch tag asset_url asset_path
   tmp=$(mktemp)
-  if ! curl -fsSL --retry 5 --retry-delay 2 --connect-timeout 15 --max-time 120 \
-      -o "$tmp" "$INSTALL_SH_URL"; then
+  if ! download_with_retry "$INSTALL_SH_URL" "$tmp" 6; then
     rm -f "$tmp"
-    die "Failed to download 3x-ui install.sh from GitHub. Check outbound HTTPS."
+    die "Failed to download 3x-ui install.sh from GitHub. Check outbound HTTPS / DNS, then re-run."
+  fi
+
+  arch="$(detect_xui_arch)"
+  [[ -n "$arch" ]] || die "Unsupported CPU architecture: $(uname -m)"
+
+  if ! tag="$(resolve_3xui_latest_tag)"; then
+    rm -f "$tmp"
+    die "Failed to resolve latest 3x-ui release tag from GitHub. Check outbound HTTPS and retry."
+  fi
+  log "Resolved 3x-ui release tag: ${tag} (arch=${arch})"
+
+  mkdir -p /usr/local
+  asset_path="/usr/local/x-ui-linux-${arch}.tar.gz"
+  asset_url="${XUI_RELEASE_BASE}/download/${tag}/x-ui-linux-${arch}.tar.gz"
+  log "Pre-downloading release archive (retries on transient 5xx/504)..."
+  if ! download_with_retry "$asset_url" "$asset_path" 8; then
+    rm -f "$tmp" "$asset_path"
+    die "Downloading x-ui ${tag} failed after retries (GitHub CDN often returns 504). Ensure this server can reach github.com / release-assets.githubusercontent.com, then re-run (FORCE=1 if partial)."
+  fi
+  if [[ ! -s "$asset_path" ]]; then
+    rm -f "$tmp" "$asset_path"
+    die "Downloaded x-ui archive is empty: ${asset_path}"
+  fi
+  log "Release archive ready: ${asset_path} ($(wc -c <"$asset_path" | tr -d ' ') bytes)"
+
+  # Prefer pre-fetched archive: skip official curl when the file already exists.
+  # Keep checksum verification path intact (sidecar may 404 on older tags — official tolerates that).
+  if grep -q 'Downloading x-ui failed' "$tmp"; then
+    # Insert a guard immediately before the first release curl -o ${xui_folder}-linux-...
+    # Portable approach: redefine curl inside the temp script for release asset URLs only.
+    local shim
+    shim=$(mktemp)
+    cat > "$shim" <<'SHIM'
+# --- injected by install-minimal-vless-ws: resilient GitHub asset fetch ---
+_xui_real_curl() { command curl "$@"; }
+curl() {
+  local -a args=("$@")
+  local out="" url="" i have_tarball=0 want_write_code=0
+  for ((i=0; i<${#args[@]}; i++)); do
+    case "${args[$i]}" in
+      -o|--output)
+        if (( i+1 < ${#args[@]} )); then out="${args[$((i+1))]}"; fi
+        ;;
+      -w|--write-out)
+        want_write_code=1
+        ;;
+      https://github.com/*/releases/download/*.tar.gz)
+        url="${args[$i]}"; have_tarball=1
+        ;;
+    esac
+  done
+  # Only short-circuit the main release tarball when already pre-fetched.
+  if [[ $have_tarball -eq 1 && -n "$out" && -s "$out" && "$out" == *x-ui-linux-*.tar.gz && "$out" != *.sha256 ]]; then
+    echo -e "\033[0;32mUsing pre-downloaded release archive: ${out}\033[0m" >&2
+    if [[ $want_write_code -eq 1 ]]; then
+      printf '%s' '200'
+    fi
+    return 0
+  fi
+  if [[ $have_tarball -eq 1 && -n "$out" && -n "$url" ]]; then
+    local attempt=1 max=8 delay=3 partial code
+    partial="${out}.partial.$$"
+    while (( attempt <= max )); do
+      rm -f "$partial"
+      code=$(_xui_real_curl -sS -L --connect-timeout 20 --max-time 600 -o "$partial" -w '%{http_code}' "$url" 2>/dev/null) || true
+      [[ -n "$code" ]] || code="000"
+      if [[ "$code" == "200" && -s "$partial" ]]; then
+        mv -f "$partial" "$out"
+        if [[ $want_write_code -eq 1 ]]; then
+          printf '%s' '200'
+        fi
+        return 0
+      fi
+      echo -e "\033[0;33mRelease download failed (attempt ${attempt}/${max}, http=${code}); retrying...\033[0m" >&2
+      rm -f "$partial"
+      (( attempt >= max )) && break
+      sleep "$delay"
+      delay=$(( delay * 2 )); (( delay > 30 )) && delay=30
+      attempt=$((attempt + 1))
+    done
+    rm -f "$partial"
+    if [[ $want_write_code -eq 1 ]]; then
+      printf '%s' "${code:-000}"
+    fi
+    return 22
+  fi
+  _xui_real_curl "$@"
+}
+# --- end inject ---
+SHIM
+    cat "$shim" "$tmp" > "${tmp}.new"
+    mv -f "${tmp}.new" "$tmp"
+    rm -f "$shim"
   fi
 
   # Strip leading/trailing slashes for setting; panel stores with slashes
@@ -465,6 +814,8 @@ install_3xui() {
     die "3x-ui official install.sh failed. See messages above. Fix and re-run (FORCE=1 if partial)."
   fi
   rm -f "$tmp"
+  # Official script removes the archive after extract; clean any leftover partials
+  rm -f "${asset_path}.partial."* 2>/dev/null || true
 
   # Wait for binary + service
   local i
@@ -481,7 +832,6 @@ install_3xui() {
   systemctl is-active --quiet x-ui || die "x-ui service failed to start. Check: journalctl -u x-ui -n 50"
   log "3x-ui installed and running"
 }
-
 
 # Guarantee VLESS "decryption":"none" in DB + bin/config.json.
 # Current xray-core hard-requires it; missing field → exit 23 / no :443 bind.
@@ -928,7 +1278,7 @@ EOF
   echo -e "${green}────────────────────────────────────────────────────────────${plain}"
   echo -e "Saved (mode 600): ${CRED_FILE}"
   echo -e "Inbound: VLESS + WS security=none  path=/  port=${INBOUND_PORT}"
-  echo -e "Sysctl:  ${SYSCTL_FILE} (BBR if kernel supports; else FQ+64MB only)"
+  echo -e "Sysctl:  ${SYSCTL_FILE} (BBR/FQ only if live-verified; else buffers only)"
   echo -e "${yellow}云安全组 / Security group: allow TCP ${INBOUND_PORT} + ${panel_port}${plain}"
   echo -e "${green}════════════════════════════════════════════════════════════${plain}"
   echo
@@ -1021,4 +1371,7 @@ main() {
   save_and_print "$panel_url" "$panel_user" "$panel_pass" "$vless" "$panel_port" "$wbp_url" "$uuid" "$remark" "$server_ip"
 }
 
-main "$@"
+# Allow tests to source helpers without executing installer.
+if [[ "${INSTALL_MINIMAL_VLESS_WS_LIB:-0}" != "1" ]]; then
+  main "$@"
+fi
