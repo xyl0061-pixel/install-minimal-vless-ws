@@ -391,8 +391,103 @@ check_internet() {
   [[ $ok -eq 1 ]] || die "No internet connectivity (need GitHub + package mirrors). Fix network/DNS and retry."
 }
 
+# ---------- runtime prerequisites (python3 / sqlite3 / jq) ----------
+# create_vless_inbound uses jq when present, otherwise hardcoded `python3`
+# (json / stdlib). That path failed mid-install on CentOS 7.6 when jq was
+# absent (EPEL not added) and python3 was never installed/verified.
+# Do not replace /usr/bin/python (system Python 2). Official repos only.
+
+# Existing later snippets use f-strings / urllib.parse, so require 3.6+ and:
+# json, sqlite3, sys, os, re, uuid, urllib.parse
+python3_runtime_ok() {
+  local bin="${1:-python3}"
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  "$bin" -c 'import sys,json,sqlite3,os,re,uuid,urllib.parse
+assert sys.version_info[0] == 3 and sys.version_info[1] >= 6
+' >/dev/null 2>&1
+}
+
+# If official package laid down python3.6/python36 but no `python3` name,
+# add a missing python3 symlink only — never overwrite, never touch `python`.
+maybe_link_python3_name() {
+  command -v python3 >/dev/null 2>&1 && return 0
+  local cand
+  for cand in python3.12 python3.11 python3.10 python3.9 python3.8 python3.7 python3.6 python36; do
+    if python3_runtime_ok "$cand"; then
+      if [[ -e /usr/bin/python3 ]]; then
+        return 0
+      fi
+      if ln -s "$(command -v "$cand")" /usr/bin/python3 2>/dev/null; then
+        log "Linked /usr/bin/python3 -> $(command -v "$cand") (did not touch /usr/bin/python)"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+try_install_python3() {
+  log "Ensuring python3 (3.6+ with json/sqlite3 stdlib) from official repos only..."
+  case "${PKG_FAM:-}" in
+    apt)
+      apt-get install -y -q python3 >/dev/null 2>&1 || true
+      ;;
+    dnf)
+      dnf install -y -q python3 >/dev/null 2>&1 || true
+      ;;
+    yum)
+      yum install -y python3 >/dev/null 2>&1 || true
+      ;;
+  esac
+  maybe_link_python3_name || true
+}
+
+# Fail early if inbound JSON/DB tools cannot be satisfied. Never claim success later.
+verify_install_runtime() {
+  command -v curl >/dev/null 2>&1 || die "curl missing after package install"
+  command -v tar >/dev/null 2>&1 || die "tar missing after package install"
+  command -v openssl >/dev/null 2>&1 || die "openssl missing after package install"
+
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    case "${PKG_FAM:-}" in
+      apt) apt-get install -y -q sqlite3 >/dev/null 2>&1 || true ;;
+      dnf) dnf install -y -q sqlite >/dev/null 2>&1 || dnf install -y -q sqlite3 >/dev/null 2>&1 || true ;;
+      yum) yum install -y sqlite >/dev/null 2>&1 || yum install -y sqlite3 >/dev/null 2>&1 || true ;;
+    esac
+  fi
+
+  if ! python3_runtime_ok python3; then
+    try_install_python3
+  fi
+
+  local have_jq=0 have_py=0 have_sql=0
+  command -v jq >/dev/null 2>&1 && have_jq=1
+  python3_runtime_ok python3 && have_py=1
+  command -v sqlite3 >/dev/null 2>&1 && have_sql=1
+
+  # JSON for VLESS settings: jq OR python3 (script else-branch is `python3`).
+  if [[ $have_jq -eq 0 && $have_py -eq 0 ]]; then
+    die "Missing python3 3.6+ (stdlib: json, sqlite3, urllib.parse) and jq is not installed. Inbound JSON cannot be built. On CentOS 7 try official 'yum install python3' (vault extras; do not replace system python2). If the official package is unavailable, install python3 from a source you trust, then re-run. (EPEL/jq not auto-added.)"
+  fi
+
+  # DB writes: sqlite3 CLI OR python3 sqlite3 module
+  if [[ $have_sql -eq 0 && $have_py -eq 0 ]]; then
+    die "Need sqlite3 CLI or python3 with sqlite3 stdlib to write the 3x-ui DB. Package install did not provide either."
+  fi
+
+  local pyver="" extra=""
+  if [[ $have_py -eq 1 ]]; then
+    pyver=$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || echo "?")
+    [[ $have_sql -eq 1 ]] && extra="${extra}; sqlite3 CLI"
+    [[ $have_jq -eq 1 ]] && extra="${extra}; jq"
+    log "Runtime OK: python3 ${pyver} + required stdlib${extra}"
+  else
+    log "Runtime OK: jq + sqlite3 CLI (python3 not required for this host)"
+  fi
+}
+
 install_deps() {
-  log "Installing dependencies (curl wget tar unzip socat openssl ca-certificates jq sqlite3 uuid-runtime)..."
+  log "Installing dependencies (curl wget tar unzip socat openssl ca-certificates jq sqlite3 uuid-runtime python3)..."
   export DEBIAN_FRONTEND=noninteractive
   case "$PKG_FAM" in
     apt)
@@ -404,6 +499,7 @@ install_deps() {
           curl wget tar unzip socat openssl ca-certificates jq sqlite3
       # uuid-runtime optional on some
       apt-get install -y -q uuid-runtime >/dev/null 2>&1 || true
+      apt-get install -y -q python3 >/dev/null 2>&1 || true
       ;;
     dnf)
       pkg_retry "dnf makecache" dnf makecache -y
@@ -415,6 +511,7 @@ install_deps() {
       dnf install -y -q util-linux >/dev/null 2>&1 || true
       # sqlite package name varies
       dnf install -y -q sqlite >/dev/null 2>&1 || dnf install -y -q sqlite3 >/dev/null 2>&1 || true
+      dnf install -y -q python3 >/dev/null 2>&1 || true
       ;;
     yum)
       maybe_fix_centos7_yum_repos
@@ -430,6 +527,8 @@ install_deps() {
       yum install -y jq >/dev/null 2>&1 || true
       yum install -y sqlite >/dev/null 2>&1 || yum install -y sqlite3 >/dev/null 2>&1 || true
       yum install -y util-linux >/dev/null 2>&1 || true
+      # Official python3 (3.6) when present in vault/extras; never add EPEL/IUS, never replace python2
+      yum install -y python3 >/dev/null 2>&1 || true
       # Refresh CA bundle when possible (EOL hosts may have stale roots)
       yum update -y ca-certificates >/dev/null 2>&1 || true
       ;;
@@ -438,10 +537,7 @@ install_deps() {
   command -v curl >/dev/null 2>&1 || die "curl missing after package install"
   command -v tar >/dev/null 2>&1 || die "tar missing after package install"
   command -v openssl >/dev/null 2>&1 || die "openssl missing after package install"
-  if ! command -v sqlite3 >/dev/null 2>&1; then
-    warn "sqlite3 CLI not found; will try python3 for DB writes"
-    command -v python3 >/dev/null 2>&1 || die "Need sqlite3 or python3 to create inbound in 3x-ui DB"
-  fi
+  verify_install_runtime
 }
 
 check_port_443() {
