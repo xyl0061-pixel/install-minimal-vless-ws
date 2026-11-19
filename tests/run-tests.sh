@@ -373,6 +373,149 @@ test_default_main_still_refuses_existing_without_inbound_only() {
   fi
 }
 
+# Official prebuilt linux-x64 tools need GLIBC_2.38 and must not be reused on EL7.
+test_elf_glibc_rejects_modern_prebuilt() {
+  local bin="${SQLITE_MODERN_PREBUILT:-/tmp/sqlite-compat-audit/sqlite3}"
+  if [[ ! -f "$bin" ]]; then
+    echo "FAIL  official linux-x64 prebuilt missing at $bin (needed for glibc reject regression)"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  assert_false "official linux-x64 3540100 tools rejected for glibc 2.17" elf_glibc_ok_for_el7 "$bin"
+  assert_false "modern prebuilt is not reusable as private sqlite" c7_private_sqlite_reusable "$bin"
+}
+
+# Conservatively linked official 3.54.1 amalgamation (host gcc + glibc 2.17 sysroot).
+test_elf_glibc_accepts_sysroot_built() {
+  local bin="${SQLITE_C7_SYSROOT_BIN:-/tmp/sqlite-amal/sqlite3-c7-nopie}"
+  if [[ ! -x "$bin" ]]; then
+    echo "FAIL  sysroot-built sqlite3 missing at $bin"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  assert_true "sysroot-built 3.54.1 ELF is glibc<=2.17" elf_glibc_ok_for_el7 "$bin"
+  assert_true "sysroot-built 3.54.1 supports expr index" sqlite_cli_supports_expr_index "$bin"
+}
+
+# Functional run under the real CentOS 7 ld-2.17 loader (sysroot, not a full guest).
+test_c7_loader_runs_sysroot_sqlite() {
+  local bin="${SQLITE_C7_SYSROOT_BIN:-/tmp/sqlite-amal/sqlite3-c7-nopie}"
+  local ld="${C7_LD_LINUX:-/tmp/c7sysroot/lib64/ld-linux-x86-64.so.2}"
+  local lib="${C7_LIB_PATH:-/tmp/c7sysroot/lib64:/tmp/c7sysroot/usr/lib64}"
+  if [[ ! -x "$bin" || ! -e "$ld" ]]; then
+    echo "FAIL  c7 loader or sysroot sqlite missing (ld=$ld bin=$bin)"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  local out rc=0
+  out=$("$ld" --library-path "$lib" "$bin" --version 2>&1) || rc=$?
+  if [[ "$rc" -eq 0 ]] && printf '%s' "$out" | grep -q '^3\.54\.1'; then
+    echo "PASS  ld-2.17 loader runs sysroot-built sqlite 3.54.1"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  ld-2.17 loader run (rc=$rc out=${out})"
+    FAIL=$((FAIL + 1))
+  fi
+  local db="$TMPBASE/c7-loader-expr.db"
+  rm -f "$db"
+  out=$("$ld" --library-path "$lib" "$bin" "$db" "CREATE TABLE clients(email TEXT); CREATE INDEX idx_clients_email_lower ON clients (LOWER(email)); INSERT INTO clients VALUES('a@b'); SELECT email FROM clients;" 2>&1) || rc=$?
+  if [[ "$rc" -eq 0 ]] && printf '%s' "$out" | grep -q 'a@b'; then
+    echo "PASS  ld-2.17 loader sqlite can use idx_clients_email_lower"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  ld-2.17 loader expr-index (rc=$rc out=${out})"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# Same compile recipe the installer uses (official amalgamation, no make/readline/zlib).
+test_official_amalgamation_compile_recipe() {
+  local src="${SQLITE_AMAL_SRC:-/tmp/sqlite-amal/sqlite-amalgamation-3540100}"
+  if [[ ! -f "$src/shell.c" || ! -f "$src/sqlite3.c" ]]; then
+    echo "FAIL  official amalgamation sources missing at $src"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  local out="$TMPBASE/sqlite3-amalgamation-built" rc=0
+  gcc -O2 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION \
+    "$src/shell.c" "$src/sqlite3.c" -o "$out" -ldl -lpthread -lm || rc=$?
+  assert_eq "amalgamation compile recipe exit" "$rc" "0"
+  local ver
+  ver=$("$out" --version 2>/dev/null | awk '{print $1}')
+  assert_eq "compiled official amalgamation version" "$ver" "3.54.1"
+  assert_true "compiled amalgamation supports expr index" sqlite_cli_supports_expr_index "$out"
+}
+
+# ensure_centos7_modern_sqlite must refuse a glibc-too-new cache and compile instead.
+# We do not invoke yum; we assert the reusable-check + fallback wording in the function.
+test_ensure_rejects_modern_cache_and_falls_back_to_compile() {
+  local bin="${SQLITE_MODERN_PREBUILT:-/tmp/sqlite-compat-audit/sqlite3}"
+  if [[ ! -f "$bin" ]]; then
+    echo "FAIL  modern prebuilt missing for cache-fallback test"
+    FAIL=$((FAIL + 1))
+    return
+  fi
+  if ! c7_private_sqlite_reusable "$bin" && ! elf_glibc_ok_for_el7 "$bin"; then
+    echo "PASS  cached modern prebuilt fails reusable+elf checks (compile fallback)"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  cached modern prebuilt was treated as reusable"
+    FAIL=$((FAIL + 1))
+  fi
+  if grep -q 'Falling back to compiling official amalgamation' "$SCRIPT" \
+     && grep -q 'gcc -O2' "$SCRIPT" \
+     && grep -q 'shell.c' "$SCRIPT" \
+     && grep -q 'sqlite3.c' "$SCRIPT" \
+     && grep -q -- '-ldl -lpthread -lm' "$SCRIPT" \
+     && grep -q 'C7_SQLITE_AMAL_URL' "$SCRIPT" \
+     && ! grep -q 'sqlite-tools-linux-x64-3540100.zip' "$SCRIPT"; then
+    echo "PASS  installer compiles official amalgamation (no linux-x64 tools zip runtime)"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  installer still references prebuilt tools zip or missing compile recipe"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+test_inbound_only_backs_up_and_protects_existing_443() {
+  if grep -A80 'inbound_only_main()' "$SCRIPT" | grep -q 'backup_xui_db_inbound_only' \
+     && grep -A120 'inbound_only_main()' "$SCRIPT" | grep -q 'SELECT id FROM inbounds WHERE port=${INBOUND_PORT}' \
+     && grep -A160 'inbound_only_main()' "$SCRIPT" | grep -q 'not calling create_vless_inbound' \
+     && grep -A160 'inbound_only_main()' "$SCRIPT" | grep -q 'check_port_443'; then
+    echo "PASS  inbound_only backs up DB and skips create when :443 exists"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  inbound_only backup / existing-443 protection structure"
+    FAIL=$((FAIL + 1))
+  fi
+  # check_port_443 must not run before the existing-inbound inspection
+  local order
+  order=$(awk '/^inbound_only_main\(\)/{p=1} p{print NR":"$0} /^# ---------- main ----------/{if(p){exit}}' "$SCRIPT")
+  local backup_l port_l select_l
+  backup_l=$(printf '%s\n' "$order" | awk '/backup_xui_db_inbound_only/{print $0; exit}' | cut -d: -f1)
+  select_l=$(printf '%s\n' "$order" | awk '/SELECT id FROM inbounds/{print $0; exit}' | cut -d: -f1)
+  port_l=$(printf '%s\n' "$order" | awk '/check_port_443/{print $0; exit}' | cut -d: -f1)
+  if [[ -n "$backup_l" && -n "$select_l" && -n "$port_l" && "$backup_l" -lt "$select_l" && "$select_l" -lt "$port_l" ]]; then
+    echo "PASS  inbound_only order: backup, inspect 443, then maybe check_port_443"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  inbound_only order (backup=$backup_l select=$select_l port=$port_l)"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+test_readme_env_on_bash_side_of_pipe() {
+  if grep -q 'curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh | env INBOUND_ONLY=1 REMARK=Yemio bash' "$ROOT/README.md" \
+     && ! grep -E 'REMARK=.+INBOUND_ONLY=1 curl .*\| bash' "$ROOT/README.md" >/dev/null \
+     && ! grep -E 'REMARK=zuno2 curl .*\| bash' "$ROOT/README.md" >/dev/null; then
+    echo "PASS  README places env on the bash side of the pipe"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  README still has env on the curl side of the pipe"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 echo "=== install-minimal-vless-ws tests ==="
 test_detect_ubuntu
 test_detect_centos7
@@ -395,5 +538,12 @@ test_ubuntu_skips_sqlite_compat_even_if_engine_old
 test_centos7_needs_compat_when_engine_old
 test_old_sqlite_expr_index_repro
 test_default_main_still_refuses_existing_without_inbound_only
+test_elf_glibc_rejects_modern_prebuilt
+test_elf_glibc_accepts_sysroot_built
+test_c7_loader_runs_sysroot_sqlite
+test_official_amalgamation_compile_recipe
+test_ensure_rejects_modern_cache_and_falls_back_to_compile
+test_inbound_only_backs_up_and_protects_existing_443
+test_readme_env_on_bash_side_of_pipe
 echo "=== results: PASS=${PASS} FAIL=${FAIL} ==="
 [[ "$FAIL" -eq 0 ]]

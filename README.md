@@ -48,7 +48,7 @@ When the installer reaches **creating the VLESS inbound** (after the panel is up
 
 | Situation | Behavior |
 |-----------|----------|
-| `REMARK` env already set | Use it (no prompt). Good for automation / `REMARK=foo curl\|bash`. |
+| `REMARK` env already set | Use it (no prompt). Good for automation / `curl … \| env REMARK=foo bash`. |
 | Interactive TTY, `REMARK` unset | Prompt in Chinese: 请输入节点别名…; empty input → hostname default (and say so). |
 | Non-TTY / pipe (`curl\|bash`), `REMARK` unset | Hostname default — **does not hang** waiting for input. Prints a one-line hint to set `REMARK=别名`. |
 
@@ -70,8 +70,8 @@ Examples:
 
 ```bash
 bash install-minimal-vless-ws.sh
-REMARK=zuno2 FORCE=1 bash install-minimal-vless-ws.sh
-REMARK=zuno2 curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh | bash
+env REMARK=zuno2 FORCE=1 bash install-minimal-vless-ws.sh
+curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh | env REMARK=zuno2 bash
 ```
 
 ## Robustness notes
@@ -113,7 +113,7 @@ Checked against **3x-ui v3.11.0** release `x-ui-linux-amd64.tar.gz`:
 
 A CentOS 7.6 host that already had `sqlite3` but neither `jq` nor `python3` previously reached “Creating single VLESS + WebSocket inbound” and then failed with `python3: command not found`. Current main installs/verifies that runtime **up front**. Stock CentOS 7.6-era repos may lack the official `python3` package (it landed in later 7.x extras); after the vault repo fix, `yum install python3` often works from the final CentOS 7 tree — this was **not** executed on a real 7.6 VPS in this change.
 
-**CentOS 7 SQLite vs 3x-ui expression indexes:** 3x-ui creates `idx_clients_email_lower` as `ON clients (LOWER(email))`, which needs SQLite **≥ 3.9.0**. Stock CentOS 7 `sqlite` / Python 3.6 typically share **libsqlite3 3.7.17**, so either engine fails with `malformed database schema (idx_clients_email_lower) - near '(': syntax error` (reproduced against a real 3.7.17 CLI). Switching to Python is **not** a fix. On **CentOS/RHEL 7 only**, the installer fetches official [sqlite.org](https://www.sqlite.org) linux-x64 tools into a **private** directory (`/usr/local/x-ui/.minimal-vless-ws-sqlite`) and routes DB writes through that binary. It does **not** drop the index, does **not** alter `/usr/bin/sqlite3` or the system library, and does **not** change the Ubuntu/Debian install or inbound path.
+**CentOS 7 SQLite vs 3x-ui expression indexes:** 3x-ui creates `idx_clients_email_lower` as `ON clients (LOWER(email))`, which needs SQLite **≥ 3.9.0**. Stock CentOS 7 `sqlite` / Python 3.6 typically share **libsqlite3 3.7.17**, so either engine fails with `malformed database schema (idx_clients_email_lower) - near '(': syntax error` (reproduced against a real 3.7.17 CLI). Switching to Python is **not** a fix. Official sqlite.org **linux-x64 prebuilt tools** (e.g. 3.54.1) need **GLIBC_2.28/2.29/2.34/2.38** and **will not run** on CentOS 7 glibc 2.17 — they are rejected if found in the private cache. On **CentOS/RHEL 7 only**, the installer downloads the official [sqlite.org amalgamation](https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip) and compiles `shell.c` + `sqlite3.c` with official **yum gcc** (`-ldl -lpthread -lm`, no make/readline/zlib) into a **private** directory (`/usr/local/x-ui/.minimal-vless-ws-sqlite`). The resulting ELF is checked so needed GLIBC versions are **≤ 2.17**. It does **not** drop the index, does **not** alter `/usr/bin/sqlite3` or the system library/glibc, and does **not** change the Ubuntu/Debian install or inbound path. This is **not** a full-system CentOS 7 rebuild: only a private sqlite3 for panel DB writes.
 
 If the panel is already installed and the inbound step failed, re-run with `INBOUND_ONLY=1` (not `FORCE=1`, do not uninstall).
 
@@ -131,15 +131,24 @@ Mock tests (no live package/service mutation):
 bash tests/run-tests.sh
 ```
 
-Coverage includes Ubuntu vs CentOS 7 detection expectations, BBR present/absent mocks, transient download 504→success, exhausted retries, unsupported sysctl skip, python3 missing early exit, jq+sqlite3-without-python3 acceptance, yum install failure early exit, **real SQLite 3.7.17 expression-index failure**, and **Ubuntu-must-not-enter CentOS 7 sqlite compat** gating.
+Coverage includes Ubuntu vs CentOS 7 detection expectations, BBR present/absent mocks, transient download 504→success, exhausted retries, unsupported sysctl skip, python3 missing early exit, jq+sqlite3-without-python3 acceptance, yum install failure early exit, **real SQLite 3.7.17 expression-index failure**, **Ubuntu-must-not-enter CentOS 7 sqlite compat** gating, **rejecting official linux-x64 prebuilts that need GLIBC newer than 2.17**, and **compiling the official amalgamation as the fallback**.
 
-`bash -n install-minimal-vless-ws.sh` is expected clean. **No full CentOS 7.6 VM/VPS install was executed** for this change.
+`bash -n install-minimal-vless-ws.sh` is expected clean. **No full CentOS 7.6 VM/VPS install was executed** for this change. A privately compiled official 3.54.1 amalgamation was executed under a real CentOS 7 `ld-2.17` loader with official glibc 2.17 objects (sysroot), which is **not** a full guest install.
 
-If the panel is already running and only the inbound step failed:
+If the panel is already running and only the inbound step failed, put env vars on the **bash** side of the pipe (vars before `curl` are not visible to the installer):
 
 ```bash
-REMARK=Yemio INBOUND_ONLY=1 curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh | bash
+curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh | env INBOUND_ONLY=1 REMARK=Yemio bash
 ```
+
+or:
+
+```bash
+curl -fsSL -o /tmp/install-minimal-vless-ws.sh https://raw.githubusercontent.com/xyl0061-pixel/install-minimal-vless-ws/main/install-minimal-vless-ws.sh
+env INBOUND_ONLY=1 REMARK=Yemio bash /tmp/install-minimal-vless-ws.sh
+```
+
+`INBOUND_ONLY=1` backs up `/etc/x-ui/x-ui.db` first. If a `:443` inbound already exists, it is left unchanged (the create path would otherwise delete it). Port 443 is required to be free only when a new inbound will be created.
 
 Do **not** use `FORCE=1` and do **not** uninstall the panel. A default `curl|bash` without `INBOUND_ONLY=1` still refuses an existing x-ui install (same as before).
 
