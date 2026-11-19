@@ -11,6 +11,7 @@
 #
 # Optional env: REMARK PANEL_PORT PANEL_USER PANEL_PASS WEB_BASE_PATH UUID
 #               SKIP_SYSCTL=1 FORCE=1 XUI_ENABLE_FAIL2BAN=false
+#               INBOUND_ONLY=1  (reuse already-installed panel; do not reinstall / do not FORCE)
 # REMARK: if unset and stdin is a TTY, prompt when creating the VLESS inbound;
 #         if unset and non-TTY (e.g. curl|bash), default to hostname (no hang).
 #
@@ -27,6 +28,11 @@ readonly WS_PATH="/"
 readonly INSTALL_SH_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh"
 readonly XUI_RELEASE_REPO="MHSanaei/3x-ui"
 readonly XUI_RELEASE_BASE="https://github.com/MHSanaei/3x-ui/releases"
+# Official sqlite.org tools (private dir only; never overwrites /usr/bin/sqlite3).
+# Used on CentOS/RHEL 7 when system/Python SQLite is older than 3.9 (no expression indexes).
+readonly C7_SQLITE_TOOLS_URL="https://www.sqlite.org/2026/sqlite-tools-linux-x64-3540100.zip"
+readonly C7_SQLITE_TOOLS_SHA256="555635de98534d87a67ee2e6e1b0d79f494b1b33b223477d3e7a8ea0c66e416f"
+readonly C7_SQLITE_TOOLS_DIR="/usr/local/x-ui/.minimal-vless-ws-sqlite"
 
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
@@ -1380,12 +1386,266 @@ EOF
   echo
 }
 
+# ---------- CentOS 7 SQLite expression-index compat (Ubuntu path untouched) ----------
+# 3x-ui creates: CREATE INDEX idx_clients_email_lower ON clients (LOWER(email))
+# which needs SQLite >= 3.9.0. CentOS 7 ships 3.7.17; opening the DB with the
+# system CLI or Python 3.6 (same libsqlite3.so) yields:
+#   malformed database schema (idx_clients_email_lower) - near '(': syntax error
+# We do not drop that index, do not change the system sqlite library, and do
+# not alter Ubuntu install_deps / create_vless_inbound behavior.
+
+os_is_el7() {
+  [[ "${OS_ID:-}" == "centos" || "${OS_ID:-}" == "rhel" ]] && [[ "${OS_MAJOR:-}" == "7" ]]
+}
+
+sqlite_ver_ge() {
+  local ver="$1" need="$2"
+  awk -v v="$ver" -v n="$need" 'BEGIN {
+    nv = split(v, a, /[.]/); nn = split(n, b, /[.]/);
+    mx = (nv > nn) ? nv : nn;
+    for (i = 1; i <= mx; i++) {
+      ai = (i <= nv) ? (a[i] + 0) : 0;
+      bi = (i <= nn) ? (b[i] + 0) : 0;
+      if (ai > bi) exit 0;
+      if (ai < bi) exit 1;
+    }
+    exit 0;
+  }'
+}
+
+sqlite_cli_version() {
+  local bin="${1:-sqlite3}"
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  "$bin" --version 2>/dev/null | awk '{print $1; exit}'
+}
+
+python_sqlite_version() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 -c 'import sqlite3,sys; sys.stdout.write(sqlite3.sqlite_version)' 2>/dev/null
+}
+
+# Probe a sqlite3 CLI binary: can it create/use an expression index?
+sqlite_cli_supports_expr_index() {
+  local bin="${1:-sqlite3}" db rc
+  command -v "$bin" >/dev/null 2>&1 || return 1
+  db=$(mktemp "${TMPDIR:-/tmp}/vless-sqlite-probe.XXXXXX") || return 1
+  rc=0
+  "$bin" "$db" "CREATE TABLE t(email TEXT); CREATE INDEX i ON t (LOWER(email)); SELECT 1;" >/dev/null 2>&1 || rc=1
+  rm -f "$db"
+  return $rc
+}
+
+python_sqlite_supports_expr_index() {
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - <<'PY' >/dev/null 2>&1
+import sqlite3, tempfile, os, sys
+p = tempfile.mktemp(prefix="vless-pysqlite-")
+try:
+    con = sqlite3.connect(p)
+    con.execute("CREATE TABLE t(email TEXT)")
+    con.execute("CREATE INDEX i ON t (LOWER(email))")
+    con.execute("SELECT 1")
+    con.close()
+except Exception:
+    sys.exit(1)
+finally:
+    try:
+        os.remove(p)
+    except Exception:
+        pass
+PY
+}
+
+# True when the engine create_vless_inbound would use can honor expr indexes.
+# Python is checked too: EL7 python3 is typically linked to the same old libsqlite3.
+sqlite_engines_support_expr_index() {
+  local ver
+  if command -v sqlite3 >/dev/null 2>&1; then
+    ver=$(sqlite_cli_version sqlite3 || true)
+    if [[ -n "$ver" ]] && sqlite_ver_ge "$ver" "3.9.0" && sqlite_cli_supports_expr_index sqlite3; then
+      return 0
+    fi
+  fi
+  ver=$(python_sqlite_version || true)
+  if [[ -n "$ver" ]] && sqlite_ver_ge "$ver" "3.9.0" && python_sqlite_supports_expr_index; then
+    return 0
+  fi
+  return 1
+}
+
+sqlite_engine_can_open_xui_db() {
+  local db="${1:-$XUI_DB}"
+  [[ -f "$db" ]] || return 0
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$db" "SELECT 1;" >/dev/null 2>&1 && return 0
+    return 1
+  fi
+  python3 - "$db" <<'PY' >/dev/null 2>&1
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("SELECT 1")
+con.close()
+PY
+}
+
+# CentOS/RHEL 7 only. Ubuntu/Debian never enter this branch.
+need_centos7_sqlite_compat() {
+  os_is_el7 || return 1
+  if [[ -f "${XUI_DB:-}" ]] && ! sqlite_engine_can_open_xui_db "$XUI_DB"; then
+    return 0
+  fi
+  if sqlite_engines_support_expr_index; then
+    return 1
+  fi
+  return 0
+}
+
+ensure_centos7_modern_sqlite() {
+  local zip tmpdir bin found
+  mkdir -p "$C7_SQLITE_TOOLS_DIR"
+  bin="$C7_SQLITE_TOOLS_DIR/sqlite3"
+  if [[ -x "$bin" ]] && sqlite_cli_supports_expr_index "$bin"; then
+    if [[ -f "${XUI_DB:-}" ]] && ! "$bin" "$XUI_DB" "SELECT 1;" >/dev/null 2>&1; then
+      warn "Cached compat sqlite3 cannot open ${XUI_DB}; re-fetching official tools"
+    else
+      log "Using private modern sqlite3 (not /usr/bin): $bin ($("$bin" --version 2>/dev/null | awk '{print $1}'))"
+      return 0
+    fi
+  fi
+
+  case "$(uname -m)" in
+    x86_64|amd64) ;;
+    *)
+      die "CentOS 7 system SQLite is too old for 3x-ui expression indexes, and official sqlite.org linux-x64 tools do not match arch $(uname -m). Cannot write the panel DB without replacing the system sqlite (which this script will not do)."
+      ;;
+  esac
+
+  log "Fetching official sqlite.org tools for CentOS 7 DB writes (private dir; system sqlite unchanged)..."
+  zip=$(mktemp "${TMPDIR:-/tmp}/sqlite-tools.XXXXXX.zip")
+  if ! download_with_retry "$C7_SQLITE_TOOLS_URL" "$zip" 6; then
+    rm -f "$zip"
+    die "Failed to download official sqlite tools from sqlite.org. Needed because CentOS 7 SQLite < 3.9 cannot open idx_clients_email_lower. Re-run when this host can reach https://www.sqlite.org (do not use FORCE=1 if the panel is already installed)."
+  fi
+  found=$(sha256sum "$zip" 2>/dev/null | awk '{print $1}')
+  if [[ "$found" != "$C7_SQLITE_TOOLS_SHA256" ]]; then
+    rm -f "$zip"
+    die "Checksum mismatch for official sqlite-tools zip (expected ${C7_SQLITE_TOOLS_SHA256}, got ${found:-empty})"
+  fi
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/sqlite-tools.XXXXXX")
+  if ! unzip -o -q "$zip" -d "$tmpdir"; then
+    rm -rf "$tmpdir" "$zip"
+    die "Failed to unzip official sqlite-tools"
+  fi
+  found=$(find "$tmpdir" -type f -name sqlite3 -print -quit)
+  if [[ -z "$found" ]]; then
+    rm -rf "$tmpdir" "$zip"
+    die "Official sqlite-tools zip did not contain a sqlite3 binary"
+  fi
+  chmod +x "$found"
+  cp -f "$found" "$bin"
+  chmod +x "$bin"
+  rm -rf "$tmpdir" "$zip"
+  if ! sqlite_cli_supports_expr_index "$bin"; then
+    die "Private sqlite3 at ${bin} still cannot use expression indexes"
+  fi
+  if [[ -f "${XUI_DB:-}" ]] && ! "$bin" "$XUI_DB" "SELECT 1;" >/dev/null 2>&1; then
+    die "Private modern sqlite3 cannot open ${XUI_DB}. Refusing to drop indexes or alter the system sqlite library."
+  fi
+  log "Private modern sqlite3 ready: $bin ($("$bin" --version 2>/dev/null | awk '{print $1}'))"
+}
+
+# Ubuntu/Debian: identical to calling create_vless_inbound directly (no PATH change).
+run_create_vless_inbound() {
+  if need_centos7_sqlite_compat; then
+    ensure_centos7_modern_sqlite
+    log "CentOS 7: routing DB writes through private modern sqlite3 (system python/sqlite left unchanged)"
+    PATH="$C7_SQLITE_TOOLS_DIR:$PATH" create_vless_inbound "$@"
+  else
+    create_vless_inbound "$@"
+  fi
+}
+
+# Opt-in recovery when the panel is already installed (do not FORCE, do not uninstall).
+# Default curl|bash without this env is unchanged (still refuses existing x-ui).
+inbound_only_main() {
+  log "INBOUND_ONLY=1 — reuse existing panel; will not reinstall or wipe the database"
+  if ! xui_installed; then
+    die "INBOUND_ONLY=1 requires an already-installed 3x-ui panel. The official installer has not finished on this host."
+  fi
+  [[ -x "$XUI_BIN" ]] || die "x-ui binary missing (${XUI_BIN})"
+  [[ -f "$XUI_DB" ]] || die "Panel DB not found: ${XUI_DB}"
+  systemctl is-active --quiet x-ui 2>/dev/null || die "x-ui is not running. Start it with: systemctl start x-ui — then re-run with INBOUND_ONLY=1 (do not use FORCE=1)."
+
+  check_port_443
+
+  local server_ip remark panel_port panel_user panel_pass web_base uuid email_tag wbp_url panel_url vless shown_port shown_path
+
+  server_ip=$(detect_public_ip)
+  [[ -n "$server_ip" ]] || warn "Could not detect public IPv4; panel URL may need manual IP."
+  [[ -n "$server_ip" ]] || server_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  [[ -n "$server_ip" ]] || server_ip="YOUR_SERVER_IP"
+
+  shown_port=$("$XUI_BIN" setting -show true 2>/dev/null | grep -Eo 'port: .+' | awk '{print $2}' | tr -d '[:space:]' || true)
+  shown_path=$("$XUI_BIN" setting -show true 2>/dev/null | grep -Eo 'webBasePath: .+' | awk '{print $2}' | tr -d '[:space:]' || true)
+  panel_port="${PANEL_PORT:-${shown_port:-}}"
+  [[ -n "$panel_port" ]] || die "Could not determine panel port. Set PANEL_PORT=... and re-run INBOUND_ONLY=1."
+  web_base="${WEB_BASE_PATH:-${shown_path:-}}"
+  web_base="${web_base#/}"; web_base="${web_base%/}"
+
+  panel_user="${PANEL_USER:-}"
+  panel_pass="${PANEL_PASS:-}"
+  if [[ -z "$panel_user" || -z "$panel_pass" ]]; then
+    if [[ -f /etc/x-ui/install-result.env ]]; then
+      # shellcheck disable=SC1091
+      source /etc/x-ui/install-result.env
+      panel_user="${panel_user:-${XUI_USERNAME:-}}"
+      panel_pass="${panel_pass:-${XUI_PASSWORD:-}}"
+    fi
+  fi
+  if [[ -z "$panel_user" && -f "$CRED_FILE" ]]; then
+    panel_user=$(awk -F= '/^PANEL_USER=/{print substr($0,index($0,"=")+1); exit}' "$CRED_FILE")
+    panel_pass=$(awk -F= '/^PANEL_PASS=/{print substr($0,index($0,"=")+1); exit}' "$CRED_FILE")
+  fi
+  [[ -n "$panel_user" ]] || panel_user="(existing panel user)"
+  [[ -n "$panel_pass" ]] || panel_pass="(use the password printed at first panel install; not reset)"
+
+  resolve_remark "$server_ip" remark
+  [[ -n "$remark" ]] || die "REMARK resolved empty"
+
+  uuid=$(gen_uuid | tr -d '[:space:]')
+  [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Invalid UUID generated/provided: ${uuid}"
+
+  email_tag="${remark}-ws"
+  if command -v python3 >/dev/null 2>&1; then
+    email_tag=$(EMAIL_RAW="$email_tag" python3 -c 'import os,re; s=os.environ["EMAIL_RAW"]; print(re.sub(r"[^A-Za-z0-9._@-]","",s)[:64] or "node-ws")')
+  else
+    email_tag=$(printf '%s' "$email_tag" | tr -cd 'A-Za-z0-9._@-' | head -c 64)
+  fi
+  [[ -n "$email_tag" ]] || email_tag="node-ws"
+
+  run_create_vless_inbound "$uuid" "$remark" "$email_tag"
+
+  wbp_url="/${web_base}/"
+  panel_url="http://${server_ip}:${panel_port}${wbp_url}"
+  local remark_frag
+  remark_frag=$(urlencode_fragment "$remark")
+  vless="vless://${uuid}@${server_ip}:${INBOUND_PORT}?encryption=none&security=none&type=ws&path=%2F#${remark_frag}"
+
+  open_firewall "$panel_port"
+  verify_listen "$panel_port" "$wbp_url"
+  save_and_print "$panel_url" "$panel_user" "$panel_pass" "$vless" "$panel_port" "$wbp_url" "$uuid" "$remark" "$server_ip"
+}
+
 # ---------- main ----------
 main() {
   require_root
   detect_os
   check_internet
   install_deps
+  if [[ "${INBOUND_ONLY:-0}" == "1" ]]; then
+    inbound_only_main
+    return
+  fi
   handle_existing
   check_port_443
 
@@ -1454,7 +1714,7 @@ main() {
   fi
   [[ -n "$email_tag" ]] || email_tag="node-ws"
 
-  create_vless_inbound "$uuid" "$remark" "$email_tag"
+  run_create_vless_inbound "$uuid" "$remark" "$email_tag"
 
   wbp_url="/${web_base}/"
   panel_url="http://${server_ip}:${panel_port}${wbp_url}"
