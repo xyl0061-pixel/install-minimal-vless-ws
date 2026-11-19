@@ -23,6 +23,7 @@ Credentials are also saved to `/root/minimal-vless-ws-install.txt` (mode `600`).
 - Root on a **fresh** (or partially prepared) VPS
 - OS auto-detected from `/etc/os-release` (legacy CentOS: `/etc/centos-release`): **Ubuntu / Debian / CentOS (incl. 7) / Alma / Rocky / RHEL / Fedora / Amazon Linux**
 - Outbound HTTPS to **GitHub** (install script + release assets) and package mirrors
+- **python3 3.6+** with stdlib `json`, `sqlite3`, `urllib.parse` (and `os`/`re`/`uuid`), **or** `jq` plus the `sqlite3` CLI. The installer tries official packages (`yum install python3` / `apt-get install python3`) and **exits before** creating the inbound if neither path is available. It does **not** replace system Python 2 (`/usr/bin/python`) and does **not** add EPEL or other third-party repos automatically.
 - Port **443** free (script exits with a clear fix hint if busy)
 - Cloud security group / provider firewall must allow **443** and the printed panel port
 
@@ -75,6 +76,8 @@ REMARK=zuno2 curl -fsSL https://raw.githubusercontent.com/xyl0061-pixel/install-
 ## Robustness notes
 
 - Detects OS family **and version**; installs deps via `apt` / `dnf` / `yum` with retries
+- After packages: verifies **python3 3.6+ and required stdlib** (or `jq` + `sqlite3` CLI). Missing tools fail immediately — not halfway through inbound creation
+- On CentOS 7, tries official `python3` (typically 3.6 from vault/extras). If that package is not in the enabled official repos, the script stops with a clear message instead of continuing
 - **CentOS 7 EOL yum**: if `mirrorlist.centos.org` is still referenced, switches base repos to official **`vault.centos.org`** (backed up under `/etc/yum.repos.d/bak-minimal-vless-ws/`)
 - Pre-downloads the 3x-ui release tarball with **exponential backoff** (handles transient GitHub **HTTP 504**); injects a curl shim into the official `install.sh` so a prefetched archive is reused — **no third-party mirrors, no insecure TLS**
 - Root + internet + `curl`/`tar`/`openssl` required; clear errors otherwise
@@ -107,6 +110,8 @@ Checked against **3x-ui v3.11.0** release `x-ui-linux-amd64.tar.gz`:
 
 **Limits:** CentOS 7 is EOL. If package mirrors / vault / GitHub remain unreachable from the VPS, install cannot proceed without fixing network. This repo does **not** ship alternative binary mirrors.
 
+A CentOS 7.6 host that already had `sqlite3` but neither `jq` nor `python3` previously reached “Creating single VLESS + WebSocket inbound” and then failed with `python3: command not found`. Current main installs/verifies that runtime **up front**. Stock CentOS 7.6-era repos may lack the official `python3` package (it landed in later 7.x extras); after the vault repo fix, `yum install python3` often works from the final CentOS 7 tree — this was **not** executed on a real 7.6 VPS in this change.
+
 ## If download still fails (504)
 
 1. Confirm the VPS can reach GitHub: `curl -I https://github.com` and `curl -IL https://github.com/MHSanaei/3x-ui/releases/latest`
@@ -121,9 +126,9 @@ Mock tests (no live package/service mutation):
 bash tests/run-tests.sh
 ```
 
-Coverage includes Ubuntu vs CentOS 7 detection expectations, BBR present/absent mocks, transient download 504→success, exhausted retries, and unsupported sysctl skip.
+Coverage includes Ubuntu vs CentOS 7 detection expectations, BBR present/absent mocks, transient download 504→success, exhausted retries, unsupported sysctl skip, **python3 missing early exit**, jq+sqlite3-without-python3 acceptance, and **yum install failure early exit**.
 
-`bash -n install-minimal-vless-ws.sh` is expected clean. **No full CentOS 7 VM install was executed in CI/box** for this change — validate on a real CentOS 7 VPS after merge.
+`bash -n install-minimal-vless-ws.sh` is expected clean. **No full CentOS 7.6 VM/VPS install was executed** for this change — validate on the real host after merge with the same one-liner (if the panel is already uninstalled, do **not** need `FORCE=1`).
 
 ## Caveats
 

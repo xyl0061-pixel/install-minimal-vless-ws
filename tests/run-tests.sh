@@ -192,6 +192,86 @@ test_arch() {
   assert_true "arch non-empty" test -n "$a"
 }
 
+test_python3_runtime_ok_real() {
+  assert_true "host python3 3.6+ stdlib ok" python3_runtime_ok python3
+}
+
+test_python3_runtime_ok_rejects_junk() {
+  local fake="$TMPBASE/not-python3"
+  printf '%s\n' '#!/bin/sh' 'exit 1' > "$fake"
+  chmod +x "$fake"
+  assert_false "rejects non-python3 binary" python3_runtime_ok "$fake"
+}
+
+# Exact field failure: sqlite3 present, jq absent, python3 absent → must fail early.
+test_python3_missing_early_exit() {
+  local out rc=0
+  out=$(
+    exec 2>&1
+    python3_runtime_ok() { return 1; }
+    try_install_python3() { :; }
+    command() {
+      if [[ "${1:-}" == "-v" ]]; then
+        case "${2:-}" in
+          python3|jq) return 1 ;;
+          sqlite3|curl|tar|openssl) return 0 ;;
+          *) builtin command -v "$2" ;;
+        esac
+      else
+        builtin command "$@"
+      fi
+    }
+    verify_install_runtime
+  ) && rc=0 || rc=$?
+  assert_eq "python3+jq missing exits non-zero" "$rc" "1"
+  if printf '%s' "$out" | grep -q 'python3'; then
+    echo "PASS  python3 missing error mentions python3"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  python3 missing error mentions python3 (out=${out})"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+# jq + sqlite3 is enough for inbound JSON/DB; python3 optional on that path
+test_runtime_ok_with_jq_sqlite_no_python3() {
+  local rc=0
+  (
+    python3_runtime_ok() { return 1; }
+    try_install_python3() { :; }
+    command() {
+      if [[ "${1:-}" == "-v" ]]; then
+        case "${2:-}" in
+          python3) return 1 ;;
+          jq|sqlite3|curl|tar|openssl) return 0 ;;
+          *) builtin command -v "$2" ;;
+        esac
+      else
+        builtin command "$@"
+      fi
+    }
+    verify_install_runtime
+  ) && rc=0 || rc=$?
+  assert_eq "jq+sqlite3 without python3 is accepted" "$rc" "0"
+}
+
+test_yum_install_failure_early_exit() {
+  local out rc=0
+  out=$(
+    exec 2>&1
+    sleep() { :; }
+    pkg_retry "yum install" sh -c 'exit 1'
+  ) && rc=0 || rc=$?
+  assert_eq "yum install failure exits non-zero" "$rc" "1"
+  if printf '%s' "$out" | grep -q 'yum install'; then
+    echo "PASS  yum failure error names yum install"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL  yum failure error names yum install (out=${out})"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
 echo "=== install-minimal-vless-ws tests ==="
 test_detect_ubuntu
 test_detect_centos7
@@ -203,5 +283,10 @@ test_download_retry_504_then_ok
 test_download_retry_exhausted
 test_sysctl_set_safe
 test_arch
+test_python3_runtime_ok_real
+test_python3_runtime_ok_rejects_junk
+test_python3_missing_early_exit
+test_runtime_ok_with_jq_sqlite_no_python3
+test_yum_install_failure_early_exit
 echo "=== results: PASS=${PASS} FAIL=${FAIL} ==="
 [[ "$FAIL" -eq 0 ]]
