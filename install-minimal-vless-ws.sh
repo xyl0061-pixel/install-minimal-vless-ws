@@ -6,8 +6,10 @@
 #
 # Usage (root):
 #   curl -fsSL <url> | bash
+#   # Env vars must be on the bash side of the pipe, not on curl:
+#   curl -fsSL <url> | env INBOUND_ONLY=1 REMARK=Yemio bash
 #   # or
-#   bash install-minimal-vless-ws.sh
+#   env INBOUND_ONLY=1 REMARK=Yemio bash install-minimal-vless-ws.sh
 #
 # Optional env: REMARK PANEL_PORT PANEL_USER PANEL_PASS WEB_BASE_PATH UUID
 #               SKIP_SYSCTL=1 FORCE=1 XUI_ENABLE_FAIL2BAN=false
@@ -28,11 +30,17 @@ readonly WS_PATH="/"
 readonly INSTALL_SH_URL="https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh"
 readonly XUI_RELEASE_REPO="MHSanaei/3x-ui"
 readonly XUI_RELEASE_BASE="https://github.com/MHSanaei/3x-ui/releases"
-# Official sqlite.org tools (private dir only; never overwrites /usr/bin/sqlite3).
+# Official sqlite.org amalgamation, compiled on the target with official yum gcc
+# into a private dir only; never overwrites /usr/bin/sqlite3 or system glibc.
 # Used on CentOS/RHEL 7 when system/Python SQLite is older than 3.9 (no expression indexes).
-readonly C7_SQLITE_TOOLS_URL="https://www.sqlite.org/2026/sqlite-tools-linux-x64-3540100.zip"
-readonly C7_SQLITE_TOOLS_SHA256="555635de98534d87a67ee2e6e1b0d79f494b1b33b223477d3e7a8ea0c66e416f"
+# Do not ship/use official linux-x64 prebuilt tools — they need GLIBC_2.28+.
+# download.html PRODUCT hash for this zip is SHA3-256
+# 92281c86e2957f9b9305890f9ac04204caa7b677cc868dc326d942689df28e30;
+# the pin below is SHA-256 of the same official 2990966-byte archive.
+readonly C7_SQLITE_AMAL_URL="https://www.sqlite.org/2026/sqlite-amalgamation-3540100.zip"
+readonly C7_SQLITE_AMAL_SHA256="0a9c8e34352dad46006aa82836d5383bff9dc6bc9ce5a60553c05aa30e6ad1f9"
 readonly C7_SQLITE_TOOLS_DIR="/usr/local/x-ui/.minimal-vless-ws-sqlite"
+readonly C7_SQLITE_MAX_GLIBC="2.17"
 
 
 red='\033[0;31m'; green='\033[0;32m'; yellow='\033[0;33m'; blue='\033[0;34m'; plain='\033[0m'
@@ -1500,52 +1508,142 @@ need_centos7_sqlite_compat() {
   return 0
 }
 
+# True when an ELF's needed GLIBC_* versions are all <= C7_SQLITE_MAX_GLIBC (2.17).
+# Official sqlite-tools-linux-x64 prebuilts need GLIBC_2.28/2.29/2.34/2.38 and must be rejected.
+elf_glibc_ok_for_el7() {
+  local bin="$1" max="${2:-$C7_SQLITE_MAX_GLIBC}"
+  [[ -f "$bin" ]] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$bin" "$max" <<'PY'
+import re, sys
+path, maxver = sys.argv[1], sys.argv[2]
+
+def parts(s):
+    out = []
+    for p in s.split("."):
+        try:
+            out.append(int(p))
+        except ValueError:
+            break
+    return tuple(out) or (0,)
+
+def leq(a, b):
+    n = max(len(a), len(b))
+    a = a + (0,) * (n - len(a))
+    b = b + (0,) * (n - len(b))
+    return a <= b
+
+data = open(path, "rb").read()
+vers = set(re.findall(rb"GLIBC_(\d+\.\d+(?:\.\d+)?)", data))
+want = parts(maxver)
+for raw in vers:
+    if not leq(parts(raw.decode()), want):
+        sys.exit(1)
+sys.exit(0)
+PY
+    return $?
+  fi
+  local v
+  for v in $(tr -cd '[:print:]\n' < "$bin" | grep -oE 'GLIBC_[0-9]+\.[0-9]+(\.[0-9]+)?' | sed 's/^GLIBC_//' | sort -u); do
+    if ! awk -v v="$v" -v n="$max" 'BEGIN {
+      nv = split(v, a, /[.]/); nn = split(n, b, /[.]/);
+      mx = (nv > nn) ? nv : nn;
+      for (i = 1; i <= mx; i++) {
+        ai = (i <= nv) ? (a[i] + 0) : 0;
+        bi = (i <= nn) ? (b[i] + 0) : 0;
+        if (ai > bi) exit 1;
+        if (ai < bi) exit 0;
+      }
+      exit 0;
+    }'; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Cached private sqlite3 is reusable only if it is executable on glibc 2.17 and can use expr indexes.
+c7_private_sqlite_reusable() {
+  local bin="${1:-$C7_SQLITE_TOOLS_DIR/sqlite3}"
+  [[ -x "$bin" ]] || return 1
+  elf_glibc_ok_for_el7 "$bin" || return 1
+  sqlite_cli_supports_expr_index "$bin" || return 1
+  if [[ -f "${XUI_DB:-}" ]] && ! "$bin" "$XUI_DB" "SELECT 1;" >/dev/null 2>&1; then
+    return 1
+  fi
+  return 0
+}
+
+ensure_centos7_build_gcc() {
+  if command -v gcc >/dev/null 2>&1; then
+    return 0
+  fi
+  log "Installing official yum gcc to compile a private sqlite3 (system sqlite/glibc unchanged)..."
+  maybe_fix_centos7_yum_repos
+  yum install -y gcc >/dev/null 2>&1 || pkg_retry "yum install gcc" yum install -y gcc
+  command -v gcc >/dev/null 2>&1 || die "gcc is required to compile official SQLite amalgamation on CentOS 7 (yum install gcc failed). Will not use modern prebuilt sqlite tools that need GLIBC newer than 2.17, and will not replace system glibc or /usr/bin/sqlite3."
+}
+
 ensure_centos7_modern_sqlite() {
-  local zip tmpdir bin found
+  local zip tmpdir bin srcdir found_c found_s found
   mkdir -p "$C7_SQLITE_TOOLS_DIR"
   bin="$C7_SQLITE_TOOLS_DIR/sqlite3"
-  if [[ -x "$bin" ]] && sqlite_cli_supports_expr_index "$bin"; then
-    if [[ -f "${XUI_DB:-}" ]] && ! "$bin" "$XUI_DB" "SELECT 1;" >/dev/null 2>&1; then
-      warn "Cached compat sqlite3 cannot open ${XUI_DB}; re-fetching official tools"
-    else
-      log "Using private modern sqlite3 (not /usr/bin): $bin ($("$bin" --version 2>/dev/null | awk '{print $1}'))"
-      return 0
-    fi
+  if c7_private_sqlite_reusable "$bin"; then
+    log "Using private modern sqlite3 (not /usr/bin): $bin ($("$bin" --version 2>/dev/null | awk '{print $1}'))"
+    return 0
+  fi
+  if [[ -e "$bin" ]] && ! elf_glibc_ok_for_el7 "$bin"; then
+    warn "Rejecting ${bin}: ELF requires GLIBC newer than ${C7_SQLITE_MAX_GLIBC} (official linux-x64 prebuilt tools are not usable on CentOS 7). Falling back to compiling official amalgamation with this host's gcc."
+    rm -f "$bin"
+  elif [[ -e "$bin" ]]; then
+    warn "Cached private sqlite3 at ${bin} is not reusable; recompiling official amalgamation"
+    rm -f "$bin"
   fi
 
-  case "$(uname -m)" in
-    x86_64|amd64) ;;
-    *)
-      die "CentOS 7 system SQLite is too old for 3x-ui expression indexes, and official sqlite.org linux-x64 tools do not match arch $(uname -m). Cannot write the panel DB without replacing the system sqlite (which this script will not do)."
-      ;;
-  esac
+  command -v unzip >/dev/null 2>&1 || die "unzip is required to extract the official SQLite amalgamation."
+  ensure_centos7_build_gcc
 
-  log "Fetching official sqlite.org tools for CentOS 7 DB writes (private dir; system sqlite unchanged)..."
-  zip=$(mktemp "${TMPDIR:-/tmp}/sqlite-tools.XXXXXX.zip")
-  if ! download_with_retry "$C7_SQLITE_TOOLS_URL" "$zip" 6; then
+  log "Downloading official sqlite.org amalgamation and compiling a private sqlite3 for CentOS 7 (system sqlite unchanged)..."
+  zip=$(mktemp "${TMPDIR:-/tmp}/sqlite-amal.XXXXXX.zip")
+  if ! download_with_retry "$C7_SQLITE_AMAL_URL" "$zip" 6; then
     rm -f "$zip"
-    die "Failed to download official sqlite tools from sqlite.org. Needed because CentOS 7 SQLite < 3.9 cannot open idx_clients_email_lower. Re-run when this host can reach https://www.sqlite.org (do not use FORCE=1 if the panel is already installed)."
+    die "Failed to download official SQLite amalgamation from sqlite.org. Needed because CentOS 7 SQLite < 3.9 cannot open idx_clients_email_lower, and official prebuilt linux-x64 tools need a newer glibc. Re-run when this host can reach https://www.sqlite.org (do not use FORCE=1 if the panel is already installed)."
   fi
   found=$(sha256sum "$zip" 2>/dev/null | awk '{print $1}')
-  if [[ "$found" != "$C7_SQLITE_TOOLS_SHA256" ]]; then
+  if [[ "$found" != "$C7_SQLITE_AMAL_SHA256" ]]; then
     rm -f "$zip"
-    die "Checksum mismatch for official sqlite-tools zip (expected ${C7_SQLITE_TOOLS_SHA256}, got ${found:-empty})"
+    die "Checksum mismatch for official sqlite amalgamation zip (expected ${C7_SQLITE_AMAL_SHA256}, got ${found:-empty})"
   fi
-  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/sqlite-tools.XXXXXX")
+  tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/sqlite-amal.XXXXXX")
   if ! unzip -o -q "$zip" -d "$tmpdir"; then
     rm -rf "$tmpdir" "$zip"
-    die "Failed to unzip official sqlite-tools"
+    die "Failed to unzip official sqlite amalgamation"
   fi
-  found=$(find "$tmpdir" -type f -name sqlite3 -print -quit)
-  if [[ -z "$found" ]]; then
+  found_c=$(find "$tmpdir" -type f -name sqlite3.c -print -quit)
+  found_s=$(find "$tmpdir" -type f -name shell.c -print -quit)
+  if [[ -z "$found_c" || -z "$found_s" ]]; then
     rm -rf "$tmpdir" "$zip"
-    die "Official sqlite-tools zip did not contain a sqlite3 binary"
+    die "Official sqlite amalgamation zip did not contain sqlite3.c and shell.c"
   fi
-  chmod +x "$found"
-  cp -f "$found" "$bin"
+  srcdir=$(dirname "$found_c")
+  # No make, readline, or zlib. Flags are valid on CentOS 7 gcc 4.8.5.
+  # SQLITE_OMIT_LOAD_EXTENSION avoids depending on a usable libdl at runtime.
+  if ! gcc -O2 \
+      -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION \
+      "$found_s" "$found_c" \
+      -o "$bin" -ldl -lpthread -lm; then
+    rm -rf "$tmpdir" "$zip" "$bin"
+    die "gcc failed to compile official SQLite amalgamation into ${bin}. System sqlite/glibc were not changed. Install official 'yum install gcc' (and binutils) and re-run with INBOUND_ONLY=1 if the panel is already installed (do not use FORCE=1)."
+  fi
   chmod +x "$bin"
   rm -rf "$tmpdir" "$zip"
+
+  if ! elf_glibc_ok_for_el7 "$bin"; then
+    rm -f "$bin"
+    die "Compiled private sqlite3 at ${bin} still requires GLIBC newer than ${C7_SQLITE_MAX_GLIBC}. Refusing to use it. System sqlite/glibc were not changed."
+  fi
   if ! sqlite_cli_supports_expr_index "$bin"; then
+    rm -f "$bin"
     die "Private sqlite3 at ${bin} still cannot use expression indexes"
   fi
   if [[ -f "${XUI_DB:-}" ]] && ! "$bin" "$XUI_DB" "SELECT 1;" >/dev/null 2>&1; then
@@ -1565,8 +1663,62 @@ run_create_vless_inbound() {
   fi
 }
 
+# One-shot SELECT against the panel DB, using the private C7 sqlite3 when required.
+xui_db_select() {
+  local sql="$1"
+  if need_centos7_sqlite_compat; then
+    ensure_centos7_modern_sqlite
+    "$C7_SQLITE_TOOLS_DIR/sqlite3" "$XUI_DB" "$sql"
+    return
+  fi
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$XUI_DB" "$sql"
+    return
+  fi
+  python3 - "$XUI_DB" "$sql" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+cur = con.execute(sys.argv[2])
+row = cur.fetchone()
+if row:
+    print("\t".join("" if x is None else str(x) for x in row))
+con.close()
+PY
+}
+
+backup_xui_db_inbound_only() {
+  local dest ts
+  ts=$(date +%Y%m%d%H%M%S)
+  dest="${XUI_DB}.bak.inbound-only.${ts}"
+  cp -a -- "$XUI_DB" "$dest" || die "Failed to back up panel DB ${XUI_DB} before INBOUND_ONLY work"
+  log "Backed up panel DB to ${dest}"
+}
+
+extract_uuid_from_inbound_settings() {
+  local settings="$1"
+  python3 - "$settings" <<'PY'
+import json, re, sys
+raw = sys.argv[1]
+try:
+    j = json.loads(raw)
+    clients = j.get("clients") or []
+    if clients and isinstance(clients, list) and isinstance(clients[0], dict):
+        u = clients[0].get("id") or clients[0].get("uuid") or ""
+        if u:
+            print(u)
+            sys.exit(0)
+except Exception:
+    pass
+m = re.search(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", raw)
+print(m.group(0) if m else "")
+PY
+}
+
 # Opt-in recovery when the panel is already installed (do not FORCE, do not uninstall).
 # Default curl|bash without this env is unchanged (still refuses existing x-ui).
+# Backs up the DB first. If a :443 inbound already exists, leave it alone (do not
+# call create_vless_inbound, which would DELETE existing :443 rows). Only require
+# port 443 to be free when we are about to create a new inbound.
 inbound_only_main() {
   log "INBOUND_ONLY=1 — reuse existing panel; will not reinstall or wipe the database"
   if ! xui_installed; then
@@ -1576,9 +1728,10 @@ inbound_only_main() {
   [[ -f "$XUI_DB" ]] || die "Panel DB not found: ${XUI_DB}"
   systemctl is-active --quiet x-ui 2>/dev/null || die "x-ui is not running. Start it with: systemctl start x-ui — then re-run with INBOUND_ONLY=1 (do not use FORCE=1)."
 
-  check_port_443
+  backup_xui_db_inbound_only
 
   local server_ip remark panel_port panel_user panel_pass web_base uuid email_tag wbp_url panel_url vless shown_port shown_path
+  local existing_id existing_remark existing_settings
 
   server_ip=$(detect_public_ip)
   [[ -n "$server_ip" ]] || warn "Could not detect public IPv4; panel URL may need manual IP."
@@ -1612,18 +1765,36 @@ inbound_only_main() {
   resolve_remark "$server_ip" remark
   [[ -n "$remark" ]] || die "REMARK resolved empty"
 
-  uuid=$(gen_uuid | tr -d '[:space:]')
-  [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Invalid UUID generated/provided: ${uuid}"
-
-  email_tag="${remark}-ws"
-  if command -v python3 >/dev/null 2>&1; then
-    email_tag=$(EMAIL_RAW="$email_tag" python3 -c 'import os,re; s=os.environ["EMAIL_RAW"]; print(re.sub(r"[^A-Za-z0-9._@-]","",s)[:64] or "node-ws")')
+  existing_id=$(xui_db_select "SELECT id FROM inbounds WHERE port=${INBOUND_PORT} LIMIT 1;" 2>/dev/null || true)
+  existing_id=$(printf '%s' "$existing_id" | tr -d '[:space:]')
+  if [[ -n "$existing_id" ]]; then
+    existing_remark=$(xui_db_select "SELECT remark FROM inbounds WHERE id=${existing_id} LIMIT 1;" 2>/dev/null || true)
+    existing_settings=$(xui_db_select "SELECT settings FROM inbounds WHERE id=${existing_id} LIMIT 1;" 2>/dev/null || true)
+    log "Port ${INBOUND_PORT} inbound already present (id=${existing_id}, remark=${existing_remark:-unset}); leaving it unchanged (not calling create_vless_inbound)."
+    if [[ -n "${existing_remark// }" ]]; then
+      remark="$existing_remark"
+    fi
+    uuid=$(extract_uuid_from_inbound_settings "${existing_settings:-}" | tr -d '[:space:]')
+    if [[ ! "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]]; then
+      warn "Could not parse UUID from existing :${INBOUND_PORT} inbound; inbound left unchanged. Check the panel for the current client id."
+      uuid="EXISTING-INBOUND-SEE-PANEL"
+    fi
+    email_tag="${remark}-ws"
   else
-    email_tag=$(printf '%s' "$email_tag" | tr -cd 'A-Za-z0-9._@-' | head -c 64)
-  fi
-  [[ -n "$email_tag" ]] || email_tag="node-ws"
+    check_port_443
+    uuid=$(gen_uuid | tr -d '[:space:]')
+    [[ "$uuid" =~ ^[0-9a-fA-F-]{36}$ ]] || die "Invalid UUID generated/provided: ${uuid}"
 
-  run_create_vless_inbound "$uuid" "$remark" "$email_tag"
+    email_tag="${remark}-ws"
+    if command -v python3 >/dev/null 2>&1; then
+      email_tag=$(EMAIL_RAW="$email_tag" python3 -c 'import os,re; s=os.environ["EMAIL_RAW"]; print(re.sub(r"[^A-Za-z0-9._@-]","",s)[:64] or "node-ws")')
+    else
+      email_tag=$(printf '%s' "$email_tag" | tr -cd 'A-Za-z0-9._@-' | head -c 64)
+    fi
+    [[ -n "$email_tag" ]] || email_tag="node-ws"
+
+    run_create_vless_inbound "$uuid" "$remark" "$email_tag"
+  fi
 
   wbp_url="/${web_base}/"
   panel_url="http://${server_ip}:${panel_port}${wbp_url}"
